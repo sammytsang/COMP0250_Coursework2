@@ -130,10 +130,22 @@ bool cw2::pickObject(const geometry_msgs::msg::PointStamped & object_point,
   double x = object_point.point.x;
   double y = object_point.point.y;
   static constexpr double CARTESIAN_MIN_FRACTION = 0.3;
-  static constexpr double PRE_GRASP_LINK8_Z = 0.22;
-  static constexpr double DESCEND_TARGET_LINK8_Z = 0.130;
+  static constexpr double FINGER_OFFSET_LINK8 = 0.105;
+  static constexpr double FINGER_OFFSET_HAND = 0.058;
+  static constexpr double PRE_GRASP_LIFT = 0.10;
   const std::string planning_frame = arm_group_->getPlanningFrame();
   const std::string eef_link = arm_group_->getEndEffectorLink();
+  const double obj_z = object_point.point.z;
+  double finger_offset = FINGER_OFFSET_LINK8;
+
+  if (eef_link == "panda_hand") {
+    finger_offset = FINGER_OFFSET_HAND;
+  } else if (eef_link == "panda_hand_tcp") {
+    finger_offset = 0.0;
+  }
+
+  const double grasp_z = obj_z + finger_offset;
+  const double pre_grasp_z = grasp_z + PRE_GRASP_LIFT;
 
   bool ok = true;
 
@@ -145,37 +157,28 @@ bool cw2::pickObject(const geometry_msgs::msg::PointStamped & object_point,
 
   RCLCPP_INFO(
     node_->get_logger(),
-    "pickObject: planning_frame='%s', eef_link='%s' (no explicit gripper offset configured)",
+    "pickObject: planning_frame='%s', eef_link='%s', object_z=%.4f, finger_offset=%.4f",
     planning_frame.c_str(),
-    eef_link.empty() ? "<empty>" : eef_link.c_str());
+    eef_link.empty() ? "<empty>" : eef_link.c_str(),
+    obj_z,
+    finger_offset);
   RCLCPP_INFO(
     node_->get_logger(),
-    "pickObject: pre-grasp hover z=%.4f, descend target z=%.4f (panda_link8 targets)",
-    PRE_GRASP_LINK8_Z,
-    DESCEND_TARGET_LINK8_Z);
+    "pickObject: pre-grasp hover z=%.4f, descend target z=%.4f",
+    pre_grasp_z,
+    grasp_z);
 
-  // 3. Move to pre-grasp via Cartesian path — 10 cm above shape
+  // 3. Move to pre-grasp via joint-space planning for large approach motion
   geometry_msgs::msg::Pose pre_grasp =
-    makeDownwardPose(x, y, PRE_GRASP_LINK8_Z, grasp_yaw);
-  moveit_msgs::msg::RobotTrajectory trajectory;
-  std::vector<geometry_msgs::msg::Pose> waypoints = {pre_grasp};
-  double fraction = arm_group_->computeCartesianPath(
-    waypoints, 0.01, 0.0, trajectory);
-  if (fraction > CARTESIAN_MIN_FRACTION) {
-    moveit::planning_interface::MoveGroupInterface::Plan cart_plan;
-    cart_plan.trajectory_ = trajectory;
-    arm_group_->setStartStateToCurrentState();
-    ok = (arm_group_->execute(cart_plan) ==
-          moveit::core::MoveItErrorCode::SUCCESS) && ok;
-  } else {
-    RCLCPP_WARN(node_->get_logger(),
-                "pickObject: pre-grasp Cartesian fraction only %.2f", fraction);
-    ok = false;
-  }
+    makeDownwardPose(x, y, pre_grasp_z, grasp_yaw);
+  ok = moveArmToPose(pre_grasp) && ok;
 
   // 4. Descend via Cartesian path
   geometry_msgs::msg::Pose grasp_pose =
-    makeDownwardPose(x, y, DESCEND_TARGET_LINK8_Z, grasp_yaw);
+    makeDownwardPose(x, y, grasp_z, grasp_yaw);
+  moveit_msgs::msg::RobotTrajectory trajectory;
+  std::vector<geometry_msgs::msg::Pose> waypoints = {grasp_pose};
+  double fraction = 0.0;
   RCLCPP_INFO(
     node_->get_logger(),
     "pickObject: descend target pose (x=%.4f, y=%.4f, z=%.4f)",
@@ -193,8 +196,9 @@ bool cw2::pickObject(const geometry_msgs::msg::PointStamped & object_point,
           moveit::core::MoveItErrorCode::SUCCESS) && ok;
   } else {
     RCLCPP_WARN(node_->get_logger(),
-                "pickObject: descend Cartesian fraction only %.2f", fraction);
-    ok = false;
+                "pickObject: descend Cartesian fraction only %.2f; falling back to pose planning",
+                fraction);
+    ok = moveArmToPose(grasp_pose) && ok;
   }
 
   // 5. Close gripper
@@ -212,8 +216,9 @@ bool cw2::pickObject(const geometry_msgs::msg::PointStamped & object_point,
           moveit::core::MoveItErrorCode::SUCCESS) && ok;
   } else {
     RCLCPP_WARN(node_->get_logger(),
-                "pickObject: lift Cartesian fraction only %.2f", fraction);
-    ok = false;
+                "pickObject: lift Cartesian fraction only %.2f; falling back to pose planning",
+                fraction);
+    ok = moveArmToPose(pre_grasp) && ok;
   }
 
   // 8. Return to ready
@@ -229,18 +234,35 @@ bool cw2::placeObject(const geometry_msgs::msg::PointStamped & goal_point)
 {
   double x = goal_point.point.x;
   double y = goal_point.point.y;
-  double z = goal_point.point.z;
   static constexpr double CARTESIAN_MIN_FRACTION = 0.3;
-  const double pre_place_z = z + 0.195;
-  const double place_target_z = z + 0.105;
+  static constexpr double FINGER_OFFSET_LINK8 = 0.105;
+  static constexpr double FINGER_OFFSET_HAND = 0.058;
+  static constexpr double PRE_PLACE_LIFT = 0.10;
+  static constexpr double BASKET_HEIGHT = 0.05;
+  const std::string eef_link = arm_group_->getEndEffectorLink();
+  double finger_offset = FINGER_OFFSET_LINK8;
+
+  if (eef_link == "panda_hand") {
+    finger_offset = FINGER_OFFSET_HAND;
+  } else if (eef_link == "panda_hand_tcp") {
+    finger_offset = 0.0;
+  }
+
+  const double place_z = goal_point.point.z + BASKET_HEIGHT + finger_offset + 0.02;
+  const double pre_place_z = place_z + PRE_PLACE_LIFT;
 
   bool ok = true;
 
-  // 1. Move to pre-place via Cartesian path — 15 cm above basket
+  // 1. Move to pre-place via joint-space planning for large approach motion
   geometry_msgs::msg::Pose pre_place =
     makeDownwardPose(x, y, pre_place_z);
+  ok = moveArmToPose(pre_place) && ok;
+
+  // 2. Descend into basket via Cartesian
+  geometry_msgs::msg::Pose place_pose =
+    makeDownwardPose(x, y, place_z);
   moveit_msgs::msg::RobotTrajectory trajectory;
-  std::vector<geometry_msgs::msg::Pose> waypoints = {pre_place};
+  std::vector<geometry_msgs::msg::Pose> waypoints = {place_pose};
   double fraction = arm_group_->computeCartesianPath(
     waypoints, 0.01, 0.0, trajectory);
   if (fraction > CARTESIAN_MIN_FRACTION) {
@@ -251,26 +273,9 @@ bool cw2::placeObject(const geometry_msgs::msg::PointStamped & goal_point)
           moveit::core::MoveItErrorCode::SUCCESS) && ok;
   } else {
     RCLCPP_WARN(node_->get_logger(),
-                "placeObject: pre-place Cartesian fraction only %.2f", fraction);
-    ok = false;
-  }
-
-  // 2. Descend into basket via Cartesian
-  geometry_msgs::msg::Pose place_pose =
-    makeDownwardPose(x, y, place_target_z);
-  waypoints = {place_pose};
-  fraction = arm_group_->computeCartesianPath(
-    waypoints, 0.01, 0.0, trajectory);
-  if (fraction > CARTESIAN_MIN_FRACTION) {
-    moveit::planning_interface::MoveGroupInterface::Plan cart_plan;
-    cart_plan.trajectory_ = trajectory;
-    arm_group_->setStartStateToCurrentState();
-    ok = (arm_group_->execute(cart_plan) ==
-          moveit::core::MoveItErrorCode::SUCCESS) && ok;
-  } else {
-    RCLCPP_WARN(node_->get_logger(),
-                "placeObject: descend Cartesian fraction only %.2f", fraction);
-    ok = false;
+                "placeObject: descend Cartesian fraction only %.2f; falling back to pose planning",
+                fraction);
+    ok = moveArmToPose(place_pose) && ok;
   }
 
   // 3. Release
@@ -288,8 +293,9 @@ bool cw2::placeObject(const geometry_msgs::msg::PointStamped & goal_point)
           moveit::core::MoveItErrorCode::SUCCESS) && ok;
   } else {
     RCLCPP_WARN(node_->get_logger(),
-                "placeObject: ascend Cartesian fraction only %.2f", fraction);
-    ok = false;
+                "placeObject: ascend Cartesian fraction only %.2f; falling back to pose planning",
+                fraction);
+    ok = moveArmToPose(pre_place) && ok;
   }
 
   return ok;
