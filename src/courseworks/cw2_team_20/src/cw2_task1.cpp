@@ -70,7 +70,7 @@ void cw2::t1_callback(
     RCLCPP_ERROR(node_->get_logger(), "Task 1: pick failed!");
   } else {
     // 5. Place in basket
-    bool place_ok = placeObject(request->goal_point);
+    bool place_ok = placeObject(request->goal_point, pick_yaw);
     if (!place_ok) {
       RCLCPP_ERROR(node_->get_logger(), "Task 1: place failed!");
     }

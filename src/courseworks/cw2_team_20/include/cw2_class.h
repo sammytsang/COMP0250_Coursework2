@@ -82,7 +82,8 @@ public:
   bool setGripper(double width);
   bool pickObject(const geometry_msgs::msg::PointStamped & object_point,
                   double grasp_yaw = 0.0);
-  bool placeObject(const geometry_msgs::msg::PointStamped & goal_point);
+  bool placeObject(const geometry_msgs::msg::PointStamped & goal_point,
+                   double place_yaw = 0.0);
   geometry_msgs::msg::Pose makeDownwardPose(double x, double y, double z, double yaw = 0.0);
 
   // Perception helpers

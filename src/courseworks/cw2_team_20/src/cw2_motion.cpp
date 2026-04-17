@@ -230,9 +230,10 @@ bool cw2::pickObject(const geometry_msgs::msg::PointStamped & object_point,
 // ---------------------------------------------------------------------------
 // placeObject
 // ---------------------------------------------------------------------------
-bool cw2::placeObject(const geometry_msgs::msg::PointStamped & goal_point)
+bool cw2::placeObject(const geometry_msgs::msg::PointStamped & goal_point,
+                      double place_yaw)
 {
-  double x = goal_point.point.x;
+  double x = goal_point.point.x + 0.08;
   double y = goal_point.point.y;
   static constexpr double CARTESIAN_MIN_FRACTION = 0.3;
   static constexpr double FINGER_OFFSET_LINK8 = 0.105;
@@ -255,12 +256,12 @@ bool cw2::placeObject(const geometry_msgs::msg::PointStamped & goal_point)
 
   // 1. Move to pre-place via joint-space planning for large approach motion
   geometry_msgs::msg::Pose pre_place =
-    makeDownwardPose(x, y, pre_place_z);
+    makeDownwardPose(x, y, pre_place_z, place_yaw);
   ok = moveArmToPose(pre_place) && ok;
 
   // 2. Descend into basket via Cartesian
   geometry_msgs::msg::Pose place_pose =
-    makeDownwardPose(x, y, place_z);
+    makeDownwardPose(x, y, place_z, place_yaw);
   moveit_msgs::msg::RobotTrajectory trajectory;
   std::vector<geometry_msgs::msg::Pose> waypoints = {place_pose};
   double fraction = arm_group_->computeCartesianPath(
