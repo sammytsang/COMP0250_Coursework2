@@ -42,20 +42,30 @@ void cw2::t1_callback(
 
   // 4. Pick the object
   geometry_msgs::msg::PointStamped grasp_point = request->object_point;
+  double pick_yaw = 0.0;
+
   if (request->shape_type == "nought") {
-    static constexpr double NOUGHT_ARM_OFFSET = 0.08;
-    grasp_point.point.x += NOUGHT_ARM_OFFSET * std::cos(grasp_yaw);
-    grasp_point.point.y += NOUGHT_ARM_OFFSET * std::sin(grasp_yaw);
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "Nought detected: offsetting grasp point by %.3fm at yaw=%.3f rad -> new grasp (%.3f, %.3f)",
-      NOUGHT_ARM_OFFSET, grasp_yaw,
+    // Centre of nought is a hollow hole.
+    // The +X arm runs VERTICALLY (along Y axis).
+    // Offset to +X arm, then close fingers along X -> pick_yaw = PI/2
+    grasp_point.point.x += 0.08;
+    pick_yaw = M_PI / 2.0;
+    RCLCPP_INFO(node_->get_logger(),
+      "Nought: grasping +X arm at (%.3f, %.3f) yaw=PI/2",
       grasp_point.point.x, grasp_point.point.y);
+
   } else {
-    RCLCPP_INFO(node_->get_logger(), "Cross detected: grasping at centroid");
+    // Cross: centre is unreliable, fingers slip between arms.
+    // The +X arm runs HORIZONTALLY (along X axis).
+    // Offset to +X arm, then close fingers along Y -> pick_yaw = 0.0
+    grasp_point.point.x += 0.08;
+    pick_yaw = 0.0;
+    RCLCPP_INFO(node_->get_logger(),
+      "Cross: grasping +X arm at (%.3f, %.3f) yaw=0.0",
+      grasp_point.point.x, grasp_point.point.y);
   }
 
-  bool pick_ok = pickObject(grasp_point, grasp_yaw);
+  bool pick_ok = pickObject(grasp_point, pick_yaw);
   if (!pick_ok) {
     RCLCPP_ERROR(node_->get_logger(), "Task 1: pick failed!");
   } else {
