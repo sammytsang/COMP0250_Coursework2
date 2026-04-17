@@ -1,4 +1,5 @@
 #include <cw2_class.h>
+#include <cmath>
 
 void cw2::t1_callback(
   const std::shared_ptr<cw2_world_spawner::srv::Task1Service::Request> request,
@@ -40,7 +41,21 @@ void cw2::t1_callback(
   }
 
   // 4. Pick the object
-  bool pick_ok = pickObject(request->object_point, grasp_yaw);
+  geometry_msgs::msg::PointStamped grasp_point = request->object_point;
+  if (request->shape_type == "nought") {
+    static constexpr double NOUGHT_ARM_OFFSET = 0.08;
+    grasp_point.point.x += NOUGHT_ARM_OFFSET * std::cos(grasp_yaw);
+    grasp_point.point.y += NOUGHT_ARM_OFFSET * std::sin(grasp_yaw);
+    RCLCPP_INFO(
+      node_->get_logger(),
+      "Nought detected: offsetting grasp point by %.3fm at yaw=%.3f rad -> new grasp (%.3f, %.3f)",
+      NOUGHT_ARM_OFFSET, grasp_yaw,
+      grasp_point.point.x, grasp_point.point.y);
+  } else {
+    RCLCPP_INFO(node_->get_logger(), "Cross detected: grasping at centroid");
+  }
+
+  bool pick_ok = pickObject(grasp_point, grasp_yaw);
   if (!pick_ok) {
     RCLCPP_ERROR(node_->get_logger(), "Task 1: pick failed!");
   } else {
