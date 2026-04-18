@@ -41,22 +41,32 @@ void cw2::t1_callback(
   }
 
   // 4. Pick the object
+  // Use the detected grasp_yaw to rotate the arm offset.
+  // We always grab the arm that is +0.08m from the centroid,
+  // but the direction of that arm depends on the shape orientation.
   geometry_msgs::msg::PointStamped grasp_point = request->object_point;
-  double pick_yaw = 0.0;
 
+  // Rotate the +0.08m offset by the detected yaw angle
+  // so we approach along the actual arm direction
+  const double ARM_OFFSET = 0.08;
+  grasp_point.point.x += ARM_OFFSET * std::cos(grasp_yaw);
+  grasp_point.point.y += ARM_OFFSET * std::sin(grasp_yaw);
+
+  // Gripper orientation:
+  //   For nought: fingers close perpendicular to the arm -> pick_yaw = grasp_yaw
+  //   For cross:  fingers close perpendicular to the arm -> pick_yaw = grasp_yaw + PI/2
+  double pick_yaw = 0.0;
   if (request->shape_type == "nought") {
-    grasp_point.point.x += 0.08;
-    pick_yaw = 0.0;            // fingers close in Y -> straddle vertical arm
+    pick_yaw = grasp_yaw;
     RCLCPP_INFO(node_->get_logger(),
-      "Nought: grasping +X arm at (%.3f, %.3f) yaw=0.0",
-      grasp_point.point.x, grasp_point.point.y);
+      "Nought: grasping arm at (%.3f, %.3f) grasp_yaw=%.3f pick_yaw=%.3f",
+      grasp_point.point.x, grasp_point.point.y, grasp_yaw, pick_yaw);
   } else {
     // cross
-    grasp_point.point.x += 0.08;
-    pick_yaw = M_PI / 2.0;    // fingers close in X -> straddle horizontal arm
+    pick_yaw = grasp_yaw + M_PI / 2.0;
     RCLCPP_INFO(node_->get_logger(),
-      "Cross: grasping +X arm at (%.3f, %.3f) yaw=PI/2",
-      grasp_point.point.x, grasp_point.point.y);
+      "Cross: grasping arm at (%.3f, %.3f) grasp_yaw=%.3f pick_yaw=%.3f",
+      grasp_point.point.x, grasp_point.point.y, grasp_yaw, pick_yaw);
   }
 
   bool pick_ok = pickObject(grasp_point, pick_yaw);
