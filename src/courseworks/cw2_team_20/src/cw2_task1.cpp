@@ -36,6 +36,10 @@ void cw2::t1_callback(
       if (shape && shape->size() > 30) {
         grasp_yaw = detectShapeYaw(shape);
         RCLCPP_INFO(node_->get_logger(), "Detected shape yaw: %.3f rad", grasp_yaw);
+        // Snap to nearest 90 degrees due to shape symmetry
+        grasp_yaw = std::round(grasp_yaw / (M_PI / 2.0)) * (M_PI / 2.0);
+        RCLCPP_INFO(node_->get_logger(),
+          "Snapped grasp_yaw to: %.3f rad", grasp_yaw);
       }
     }
   }
@@ -67,6 +71,40 @@ void cw2::t1_callback(
     RCLCPP_INFO(node_->get_logger(),
       "Cross: grasping arm at (%.3f, %.3f) grasp_yaw=%.3f pick_yaw=%.3f",
       grasp_point.point.x, grasp_point.point.y, grasp_yaw, pick_yaw);
+  }
+
+  // 3b. Cartesian overhead approach — descend straight above object
+  {
+    // First go high above using joint-space (safe, no objects nearby)
+    geometry_msgs::msg::Pose overhead =
+      makeDownwardPose(grasp_point.point.x, grasp_point.point.y,
+                       ARM_OVERHEAD_Z, pick_yaw);
+    moveArmToPose(overhead);
+
+    // Then descend straight down via Cartesian path to pre-grasp height
+    static constexpr double PRE_GRASP_LIFT = 0.10;
+    static constexpr double FINGER_OFFSET  = 0.105;
+    const double pre_grasp_z =
+      grasp_point.point.z + FINGER_OFFSET + PRE_GRASP_LIFT;
+
+    geometry_msgs::msg::Pose pre_grasp =
+      makeDownwardPose(grasp_point.point.x, grasp_point.point.y,
+                       pre_grasp_z, pick_yaw);
+
+    moveit_msgs::msg::RobotTrajectory traj;
+    std::vector<geometry_msgs::msg::Pose> wps = {pre_grasp};
+    double frac = arm_group_->computeCartesianPath(wps, 0.01, 0.0, traj);
+    if (frac > 0.3) {
+      moveit::planning_interface::MoveGroupInterface::Plan cp;
+      cp.trajectory_ = traj;
+      arm_group_->setStartStateToCurrentState();
+      arm_group_->execute(cp);
+    } else {
+      // fallback: joint-space to pre-grasp
+      moveArmToPose(pre_grasp);
+    }
+    RCLCPP_INFO(node_->get_logger(),
+      "Overhead Cartesian descent done, fraction=%.2f", frac);
   }
 
   bool pick_ok = pickObject(grasp_point, pick_yaw);
