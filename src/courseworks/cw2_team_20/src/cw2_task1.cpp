@@ -45,23 +45,17 @@ void cw2::t1_callback(
   double pick_yaw = 0.0;
 
   if (request->shape_type == "nought") {
-    // Centre of nought is a hollow hole.
-    // The +X arm runs VERTICALLY (along Y axis).
-    // Offset to +X arm, then close fingers along X -> pick_yaw = PI/2
     grasp_point.point.x += 0.08;
-    pick_yaw = M_PI / 2.0;
+    pick_yaw = 0.0;            // fingers close in Y -> straddle vertical arm
     RCLCPP_INFO(node_->get_logger(),
-      "Nought: grasping +X arm at (%.3f, %.3f) yaw=PI/2",
+      "Nought: grasping +X arm at (%.3f, %.3f) yaw=0.0",
       grasp_point.point.x, grasp_point.point.y);
-
   } else {
-    // Cross: centre is unreliable, fingers slip between arms.
-    // The +X arm runs HORIZONTALLY (along X axis).
-    // Offset to +X arm, then close fingers along Y -> pick_yaw = 0.0
+    // cross
     grasp_point.point.x += 0.08;
-    pick_yaw = 0.0;
+    pick_yaw = M_PI / 2.0;    // fingers close in X -> straddle horizontal arm
     RCLCPP_INFO(node_->get_logger(),
-      "Cross: grasping +X arm at (%.3f, %.3f) yaw=0.0",
+      "Cross: grasping +X arm at (%.3f, %.3f) yaw=PI/2",
       grasp_point.point.x, grasp_point.point.y);
   }
 
