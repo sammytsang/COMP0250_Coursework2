@@ -4,6 +4,8 @@
 #include <cmath>
 #include <limits>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 namespace
@@ -68,13 +70,10 @@ static double snapArmOff(const std::string & type, double measured_bbox,
 }
 
 // ── Material-search yaw for nought (robust for any size; PCA is degenerate) ───
-//   Scans [0°,90°) in 1° steps, counting cloud points within SEARCH_R of the
-//   four face-normal points (centroid ± arm_off along θ and θ+90°).
-//   Matches Task 1's exact approach.
-static double detectNoughtYaw(PointCPtr cloud, float arm_off)
+[[maybe_unused]] static double detectNoughtYaw(PointCPtr cloud, float arm_off)
 {
   if (!cloud || cloud->size() < 10) return 0.0;
-  const float search_r = 0.025f;   // 25mm capture radius (matches Task 1)
+  const float search_r = 0.025f;
 
   Eigen::Vector4f cen;
   pcl::compute3DCentroid(*cloud, cen);
@@ -100,8 +99,6 @@ static double detectNoughtYaw(PointCPtr cloud, float arm_off)
 }
 
 // ── Keep only shape-coloured points (R>0.50 OR B>0.50) ───────────────────────
-//   Catches purple, red, and blue shapes while rejecting black obstacles and
-//   green ground tiles.
 static PointCPtr filterShapeColour(PointCPtr cloud)
 {
   PointCPtr out(new PointC);
@@ -130,7 +127,7 @@ void cw2::t3_callback(
   arm_group_->stop();
   rclcpp::sleep_for(std::chrono::milliseconds(500));
 
-  // Retry homing up to 30 times to survive sim startup lag.
+  // ── HOME ARM (retry up to 30 times) ────────────────────────────────────────
   {
     bool homed = false;
     for (int i = 0; i < 30 && !homed; ++i) {
@@ -139,7 +136,7 @@ void cw2::t3_callback(
         homed = true;
       } else {
         RCLCPP_WARN(node_->get_logger(),
-          "Task 3: waiting for arm ready (attempt %d/30)...", i+1);
+          "Task 3: waiting for arm ready (attempt %d/30)...", i + 1);
         rclcpp::sleep_for(std::chrono::seconds(2));
       }
     }
@@ -149,33 +146,29 @@ void cw2::t3_callback(
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // PHASE 1 — WIDE COARSE SCAN (4×4 grid, 16 positions, all at z=0.65)
-  // Visit all 16 grid positions, accumulate a single combined point cloud,
-  // then return to "ready" before any processing.
+  // PHASE 1 — FULL MAT SCAN (5×5 grid, 25 positions, all at z=0.65)
   // ══════════════════════════════════════════════════════════════════════════
 
   PointCPtr combined(new PointC);
-  const std::vector<std::tuple<double,double,double>> scan_pts = {
-    {-0.50, -0.45, 0.65}, {-0.50, -0.15, 0.65}, {-0.50, +0.15, 0.65}, {-0.50, +0.45, 0.65},
-    {-0.20, -0.45, 0.65}, {-0.20, -0.15, 0.65}, {-0.20, +0.15, 0.65}, {-0.20, +0.45, 0.65},
-    {+0.15, -0.45, 0.65}, {+0.15, -0.15, 0.65}, {+0.15, +0.15, 0.65}, {+0.15, +0.45, 0.65},
-    {+0.45, -0.45, 0.65}, {+0.45, -0.15, 0.65}, {+0.45, +0.15, 0.65}, {+0.45, +0.45, 0.65}
-  };
-  for (const auto & [sx, sy, sz] : scan_pts) {
-    arm_group_->setStartStateToCurrentState();
-    if (!moveArmToPose(makeDownwardPose(sx, sy, sz, 0.0))) {
-      RCLCPP_WARN(node_->get_logger(),
-        "Task 3: scan move failed (%.2f,%.2f) — skipping", sx, sy);
-      continue;
+  const std::vector<double> xs = {-0.55, -0.30, 0.00, 0.30, 0.55};
+  const std::vector<double> ys = {-0.50, -0.25, 0.00, 0.25, 0.50};
+
+  for (double sx : xs) {
+    for (double sy : ys) {
+      arm_group_->setStartStateToCurrentState();
+      if (!moveArmToPose(makeDownwardPose(sx, sy, 0.65, 0.0))) {
+        RCLCPP_WARN(node_->get_logger(),
+          "Task 3: scan move failed (%.2f,%.2f) — skipping", sx, sy);
+        continue;
+      }
+      rclcpp::sleep_for(std::chrono::milliseconds(800));
+      PointCPtr raw = waitForFreshCloud(5000);
+      if (!raw || raw->empty()) continue;
+      PointCPtr base = transformCloudToBaseFrame(raw);
+      if (base && !base->empty()) *combined += *base;
     }
-    rclcpp::sleep_for(std::chrono::milliseconds(800));
-    PointCPtr raw = waitForFreshCloud(5000);
-    if (!raw || raw->empty()) continue;
-    PointCPtr base = transformCloudToBaseFrame(raw);
-    if (base && !base->empty()) *combined += *base;
   }
 
-  // Return to ready before processing.
   moveArmToNamedTarget("ready");
 
   if (combined->empty()) {
@@ -193,150 +186,144 @@ void cw2::t3_callback(
     combined = ground_only;
   }
 
-  // Voxel downsample at 5mm.
   combined = voxelDownsample(combined, 0.005f);
   RCLCPP_INFO(node_->get_logger(),
-    "Task 3: combined cloud after z-crop+downsample: %zu points", combined->size());
+    "Task3: combined cloud: %zu points", combined->size());
 
-  // ── Obstacle detection → MoveIt collision boxes ──────────────────────────
+  // ── OBSTACLE DETECTION ────────────────────────────────────────────────────
   std::vector<std::string> obstacle_ids;
   {
     PointCPtr dark = filterByColourRange(combined,
-                       0.0f, 0.15f, 0.0f, 0.15f, 0.0f, 0.15f);
+                                          0.00f, 0.15f,
+                                          0.00f, 0.15f,
+                                          0.00f, 0.15f);
     PointCPtr dark_up(new PointC);
     for (const auto & pt : dark->points)
-      if (std::isfinite(pt.z) && pt.z > 0.010f) dark_up->points.push_back(pt);
-    dark_up->width = static_cast<uint32_t>(dark_up->points.size());
+      if (pt.z > 0.010f) dark_up->points.push_back(pt);
+    dark_up->width  = static_cast<uint32_t>(dark_up->points.size());
     dark_up->height = 1; dark_up->is_dense = true;
-    auto obs_cl = euclideanCluster(dark_up, 0.03f, 30, 20000);
 
-    for (size_t i = 0; i < obs_cl.size(); ++i) {
-      const auto & c = obs_cl[i];
-      if (!c || c->empty()) continue;
+    auto obs_clusters = euclideanCluster(dark_up, 0.03f, 30, 20000);
+    int n = 0;
+    for (auto & c : obs_clusters) {
       Eigen::Vector4f cen = getCloudCentroid(c);
-      float xmin=1e6f, xmax=-1e6f, ymin=1e6f, ymax=-1e6f;
+      float xmin = 1e6f, xmax = -1e6f, ymin = 1e6f, ymax = -1e6f;
       for (const auto & pt : c->points) {
-        xmin=std::min(xmin,pt.x); xmax=std::max(xmax,pt.x);
-        ymin=std::min(ymin,pt.y); ymax=std::max(ymax,pt.y);
+        xmin = std::min(xmin, pt.x); xmax = std::max(xmax, pt.x);
+        ymin = std::min(ymin, pt.y); ymax = std::max(ymax, pt.y);
       }
-      const float osx = (xmax-xmin) + 0.04f;
-      const float osy = (ymax-ymin) + 0.04f;
-      const std::string id = "t3_obs_" + std::to_string(i);
-      addBoxCollisionObject(id, cen.x(), cen.y(), GROUND_Z+0.10, osx, osy, 0.22);
+      const double osx = (xmax - xmin) + 0.04;
+      const double osy = (ymax - ymin) + 0.04;
+      const std::string id = "t3_obs_" + std::to_string(n++);
+      addBoxCollisionObject(id, cen[0], cen[1], GROUND_Z + 0.10, osx, osy, 0.22);
       obstacle_ids.push_back(id);
       RCLCPP_INFO(node_->get_logger(),
-        "Task 3: obstacle %zu at (%.3f,%.3f) box(%.0f×%.0fmm)",
-        i, cen.x(), cen.y(), osx*1000.0f, osy*1000.0f);
+        "Task3 obstacle '%s': pos=(%.3f,%.3f) size=(%.3f,%.3f)",
+        id.c_str(), cen[0], cen[1], osx, osy);
     }
   }
+
   auto cleanupObstacles = [&]() {
     for (const auto & id : obstacle_ids) removeCollisionObject(id);
   };
 
-  // Basket candidates — defined early so they can also be used to exclude
-  // basket-wall clusters from coarse position finding.
-  const std::vector<std::pair<double,double>> basket_candidates = {
-    {-0.41, -0.36}, {-0.41, 0.36}
-  };
+  // ── BASKET DETECTION ──────────────────────────────────────────────────────
+  double basket_x = 0.0, basket_y = 0.0;
+  {
+    const std::vector<std::pair<double,double>> basket_candidates = {
+      {-0.41, -0.36}, {-0.41, +0.36}
+    };
+    int best_count = -1;
+    for (const auto & c : basket_candidates) {
+      int cnt = 0;
+      for (const auto & pt : combined->points) {
+        if (std::abs(pt.x - c.first)  < 0.22 &&
+            std::abs(pt.y - c.second) < 0.22) ++cnt;
+      }
+      if (cnt > best_count) { best_count = cnt; basket_x = c.first; basket_y = c.second; }
+    }
+    RCLCPP_INFO(node_->get_logger(),
+      "Task3 basket: (%.3f, %.3f) (point count=%d)",
+      basket_x, basket_y, best_count);
 
-  // ── Coarse shape positions ────────────────────────────────────────────────
-  // Find approximate cluster centroids from the combined cloud.
-  // Apply bbox and density guards but do NOT classify type here.
+    addBoxCollisionObject("t3_bsk_N", basket_x + 0.19, basket_y,         GROUND_Z + 0.025, 0.02, 0.37, 0.06);
+    addBoxCollisionObject("t3_bsk_S", basket_x - 0.19, basket_y,         GROUND_Z + 0.025, 0.02, 0.37, 0.06);
+    addBoxCollisionObject("t3_bsk_E", basket_x,         basket_y + 0.19, GROUND_Z + 0.025, 0.37, 0.02, 0.06);
+    addBoxCollisionObject("t3_bsk_W", basket_x,         basket_y - 0.19, GROUND_Z + 0.025, 0.37, 0.02, 0.06);
+  }
+
+  // ── COARSE SHAPE DETECTION ────────────────────────────────────────────────
   std::vector<std::pair<double,double>> coarse_positions;
   {
     PointCPtr shape_col = filterShapeColour(combined);
     PointCPtr shape_up(new PointC);
     for (const auto & pt : shape_col->points)
-      if (std::isfinite(pt.z) && pt.z > 0.010f) shape_up->points.push_back(pt);
-    shape_up->width = static_cast<uint32_t>(shape_up->points.size());
+      if (pt.z > 0.010f) shape_up->points.push_back(pt);
+    shape_up->width  = static_cast<uint32_t>(shape_up->points.size());
     shape_up->height = 1; shape_up->is_dense = true;
+
     auto clusters = euclideanCluster(shape_up, 0.03f, 50, 30000);
 
-    for (const auto & cl : clusters) {
-      if (!cl || cl->size() < 30) continue;
-      const double bbox = estimateBboxDim(cl);
-      if (bbox < 0.055 || bbox > 0.25) continue;
-      const Eigen::Vector4f cen = getCloudCentroid(cl);
-      if (std::hypot(cen.x(), cen.y()) < 0.15f) continue;
+    for (auto & c : clusters) {
+      if (c->size() < 30) continue;
+      const double bbox = estimateBboxDim(c);
+      if (bbox < 0.050 || bbox > 0.28) continue;
+
+      Eigen::Vector4f cen = getCloudCentroid(c);
+      if (std::hypot(cen[0], cen[1]) < 0.10) continue;
 
       float max_z = -1e6f;
-      for (const auto & pt : cl->points) max_z = std::max(max_z, pt.z);
-      if (max_z < 0.040f || max_z > 0.080f) continue;
-      max_z = std::min(max_z, 0.070f);
-      PointCPtr top_face(new PointC);
-      for (const auto & pt : cl->points)
-        if (pt.z > max_z - 0.008f) top_face->points.push_back(pt);
-      top_face->width = static_cast<uint32_t>(top_face->points.size());
-      top_face->height = 1; top_face->is_dense = true;
-      if (top_face->size() < 10) continue;
+      for (const auto & pt : c->points) max_z = std::max(max_z, pt.z);
+      if (max_z < 0.030f || max_z > 0.090f) continue;
 
-      // Density guard.
-      const float min_pts = static_cast<float>(bbox * bbox) * 5000.0f;
-      if (static_cast<float>(top_face->size()) < min_pts) {
-        RCLCPP_WARN(node_->get_logger(),
-          "Task 3 coarse: cluster at (%.3f,%.3f) rejected — low density "
-          "(top_face=%zu < required=%.0f)",
-          cen.x(), cen.y(), top_face->size(), static_cast<double>(min_pts));
+      const float top_thresh = std::min(max_z, 0.070f) - 0.010f;
+      PointCPtr top_face(new PointC);
+      for (const auto & pt : c->points)
+        if (pt.z > top_thresh) top_face->points.push_back(pt);
+      top_face->width  = static_cast<uint32_t>(top_face->points.size());
+      top_face->height = 1; top_face->is_dense = true;
+      if (top_face->size() < 8) continue;
+
+      const float min_pts = static_cast<float>(bbox * bbox * 4000.0);
+      if (top_face->size() < static_cast<size_t>(min_pts)) {
+        RCLCPP_INFO(node_->get_logger(),
+          "Task3 coarse reject (low density): top_face=%zu < required=%.0f",
+          top_face->size(), min_pts);
         continue;
       }
 
-      // Proximity guard: skip if within 0.20m of a basket candidate.
-      bool near_basket = false;
-      for (const auto & [bx, by] : basket_candidates)
-        if (std::hypot(cen.x() - bx, cen.y() - by) < 0.20) { near_basket = true; break; }
-      if (near_basket) continue;
+      if (std::hypot(cen[0] - basket_x, cen[1] - basket_y) < 0.18) continue;
 
-      coarse_positions.push_back({static_cast<double>(cen.x()),
-                                   static_cast<double>(cen.y())});
+      coarse_positions.emplace_back(cen[0], cen[1]);
       RCLCPP_INFO(node_->get_logger(),
-        "Task 3 coarse: cluster at (%.3f,%.3f) bbox=%.0fmm top_face=%zu",
-        cen.x(), cen.y(), bbox*1000.0, top_face->size());
+        "Task3 coarse: (%.3f, %.3f) bbox=%.0fmm",
+        cen[0], cen[1], bbox * 1000.0);
     }
   }
+
   RCLCPP_INFO(node_->get_logger(),
-    "Task 3: %zu coarse positions found", coarse_positions.size());
-
-  // ── Basket detection ──────────────────────────────────────────────────────
-  double basket_x = basket_candidates[0].first;
-  double basket_y = basket_candidates[0].second;
-  {
-    int best = 0;
-    for (const auto & [bx, by] : basket_candidates) {
-      int cnt = 0;
-      for (const auto & pt : combined->points) {
-        if (std::abs(pt.x - static_cast<float>(bx)) < 0.22f &&
-            std::abs(pt.y - static_cast<float>(by)) < 0.22f) ++cnt;
-      }
-      RCLCPP_INFO(node_->get_logger(),
-        "Task 3: basket candidate (%.2f,%.2f) → %d pts", bx, by, cnt);
-      if (cnt > best) { best = cnt; basket_x = bx; basket_y = by; }
-    }
-  }
-  RCLCPP_INFO(node_->get_logger(), "Task 3: basket at (%.2f,%.2f)", basket_x, basket_y);
-
-  addBoxCollisionObject("t3_bsk_N", basket_x+0.19, basket_y,      GROUND_Z+0.025, 0.02, 0.37, 0.06);
-  addBoxCollisionObject("t3_bsk_S", basket_x-0.19, basket_y,      GROUND_Z+0.025, 0.02, 0.37, 0.06);
-  addBoxCollisionObject("t3_bsk_E", basket_x,      basket_y+0.19, GROUND_Z+0.025, 0.37, 0.02, 0.06);
-  addBoxCollisionObject("t3_bsk_W", basket_x,      basket_y-0.19, GROUND_Z+0.025, 0.37, 0.02, 0.06);
+    "Task3: %zu coarse positions found", coarse_positions.size());
 
   // ══════════════════════════════════════════════════════════════════════════
-  // PHASE 2 — INDIVIDUAL CONFIRMATION SCAN (Task 2's exact method)
-  // For each coarse position: move 0.50m above, classify from close-up cloud,
-  // return to "ready" after each one.
+  // PHASE 2 — INDIVIDUAL CLOSE-UP SCAN (Task 2 exact method)
   // ══════════════════════════════════════════════════════════════════════════
 
   constexpr double CLOSEUP_HEIGHT = 0.50;
   constexpr double CLOSEUP_CROP   = 0.15;
 
   std::vector<DetectedShape> detected;
-  for (const auto & [px, py] : coarse_positions) {
+
+  for (const auto & p : coarse_positions) {
+    const double px = p.first, py = p.second;
+
     moveArmToNamedTarget("ready");
     if (!moveArmToPose(makeDownwardPose(px, py, CLOSEUP_HEIGHT, 0.0))) {
       RCLCPP_WARN(node_->get_logger(),
-        "Task 3: confirmation move failed at (%.3f,%.3f) — skipping", px, py);
+        "Task3: close-up move failed at (%.3f,%.3f) — skipping", px, py);
       moveArmToNamedTarget("ready");
       continue;
     }
+    rclcpp::sleep_for(std::chrono::milliseconds(500));
 
     PointCPtr raw = waitForFreshCloud(5000);
     if (!raw || raw->empty()) {
@@ -344,227 +331,238 @@ void cw2::t3_callback(
       continue;
     }
 
-    PointCPtr base     = transformCloudToBaseFrame(raw);
-    PointCPtr cropped  = cropBoxAroundPoint(base, px, py, 0.0, CLOSEUP_CROP);
-    PointCPtr no_ground = removeGroundPlane(cropped, 0.012f);
-
+    PointCPtr base       = transformCloudToBaseFrame(raw);
+    PointCPtr cropped    = cropBoxAroundPoint(base, px, py, 0.0, CLOSEUP_CROP);
+    PointCPtr no_ground  = removeGroundPlane(cropped, 0.012f);
     if (!no_ground || no_ground->empty()) {
       moveArmToNamedTarget("ready");
       continue;
     }
 
-    // Top face: keep points within 12mm of the highest z.
-    float cf_max_z = -1e6f;
-    for (const auto & p : no_ground->points)
-      if (std::isfinite(p.z)) cf_max_z = std::max(cf_max_z, p.z);
+    float max_z = -1e6f;
+    for (const auto & pt : no_ground->points) max_z = std::max(max_z, pt.z);
     PointCPtr top_face(new PointC);
-    for (const auto & p : no_ground->points)
-      if (std::isfinite(p.z) && p.z > cf_max_z - 0.012f)
-        top_face->points.push_back(p);
+    for (const auto & pt : no_ground->points)
+      if (pt.z > max_z - 0.012f) top_face->points.push_back(pt);
     top_face->width  = static_cast<uint32_t>(top_face->points.size());
     top_face->height = 1; top_face->is_dense = true;
 
     if (top_face->size() < 30) {
       RCLCPP_WARN(node_->get_logger(),
-        "Task 3: too few top-face points (%zu) at (%.3f,%.3f) — skipping",
+        "Task3: too few top-face points (%zu) at (%.3f,%.3f)",
         top_face->size(), px, py);
       moveArmToNamedTarget("ready");
       continue;
     }
 
-    const std::string type = classifyShape(top_face);
+    std::string type = classifyShape(top_face);
     if (type != "nought" && type != "cross") {
       moveArmToNamedTarget("ready");
       continue;
     }
 
-    Eigen::Vector4f cen    = getCloudCentroid(top_face);
-    const double accurate_cx = static_cast<double>(cen.x());
-    const double accurate_cy = static_cast<double>(cen.y());
-    const double bbox        = estimateBboxDim(top_face);
-    double snapped_bbox      = bbox;
-    const double arm_off     = snapArmOff(type, bbox, snapped_bbox);
+    Eigen::Vector4f cen = getCloudCentroid(top_face);
+    const double bbox = estimateBboxDim(top_face);
+    double snapped_bbox = bbox;
+    const double arm_off = snapArmOff(type, bbox, snapped_bbox);
 
-    detected.push_back({cen, type, snapped_bbox, arm_off});
+    detected.push_back(DetectedShape{cen, type, snapped_bbox, arm_off});
     RCLCPP_INFO(node_->get_logger(),
       "Task3 confirmed: %s at (%.3f,%.3f) bbox=%.0fmm arm_off=%.0fmm",
-      type.c_str(), accurate_cx, accurate_cy,
-      snapped_bbox*1000.0, arm_off*1000.0);
+      type.c_str(), cen[0], cen[1], snapped_bbox * 1000.0, arm_off * 1000.0);
 
     moveArmToNamedTarget("ready");
   }
 
-  // Basket proximity post-filter (0.20m).
+  // Post-filter: drop anything inside basket footprint.
   detected.erase(
     std::remove_if(detected.begin(), detected.end(),
-      [&](const DetectedShape & s) {
-        for (const auto & [bx, by] : basket_candidates)
-          if (std::hypot(s.centroid.x() - bx, s.centroid.y() - by) < 0.20)
-            return true;
-        return false;
+      [&](const DetectedShape & d) {
+        return std::hypot(d.centroid[0] - basket_x,
+                          d.centroid[1] - basket_y) < 0.18;
       }),
     detected.end());
 
-  // Count and report.
   int n_nought = 0, n_cross = 0;
-  for (const auto & s : detected) {
-    if (s.type == "nought") ++n_nought; else ++n_cross;
+  for (const auto & d : detected) {
+    if      (d.type == "nought") ++n_nought;
+    else if (d.type == "cross")  ++n_cross;
   }
-  const int         total      = n_nought + n_cross;
-  const std::string common     = (n_nought >= n_cross) ? "nought" : "cross";
-  const int         num_common = (n_nought >= n_cross) ? n_nought : n_cross;
+  const int total = n_nought + n_cross;
+  const std::string common = (n_nought >= n_cross) ? "nought" : "cross";
+  const int num_common = std::max(n_nought, n_cross);
 
   response->total_num_shapes      = total;
   response->num_most_common_shape = num_common;
-
   RCLCPP_INFO(node_->get_logger(),
-    "Task 3: noughts=%d crosses=%d total=%d → most_common=%s(%d)",
+    "Task3: noughts=%d crosses=%d total=%d most_common=%s(%d)",
     n_nought, n_cross, total, common.c_str(), num_common);
 
   // ══════════════════════════════════════════════════════════════════════════
-  // PHASE 3 — PICK AND PLACE (Task 1's exact method)
+  // PHASE 3 — PICK AND PLACE (Task 1 exact method)
   // ══════════════════════════════════════════════════════════════════════════
 
-  // Sort candidates of the most common type by distance from base, nearest first.
   std::vector<DetectedShape *> candidates;
-  for (auto & s : detected)
-    if (s.type == common) candidates.push_back(&s);
+  for (auto & d : detected) {
+    if (d.type == common) candidates.push_back(&d);
+  }
   std::sort(candidates.begin(), candidates.end(),
     [](const DetectedShape * a, const DetectedShape * b) {
-      return std::hypot(a->centroid.x(), a->centroid.y()) <
-             std::hypot(b->centroid.x(), b->centroid.y());
+      return std::hypot(a->centroid[0], a->centroid[1])
+           < std::hypot(b->centroid[0], b->centroid[1]);
     });
 
   bool pick_success = false;
+
   for (DetectedShape * shape : candidates) {
-    const double cx     = static_cast<double>(shape->centroid.x());
-    const double cy     = static_cast<double>(shape->centroid.y());
+    const double cx      = shape->centroid[0];
+    const double cy      = shape->centroid[1];
     const double arm_off = shape->arm_off;
+    const std::string & type = shape->type;
 
-    if (std::hypot(cx, cy) < 0.12) {
-      RCLCPP_WARN(node_->get_logger(),
-        "Task 3: skipping %s at (%.3f,%.3f) — too close to base",
-        shape->type.c_str(), cx, cy);
-      continue;
-    }
+    if (std::hypot(cx, cy) < 0.12) continue;
 
-    // Move to ready, then 0.50m above the confirmed centroid and take a fresh cloud.
+    // ── STEP A: observe ────────────────────────────────────────────────────
     moveArmToNamedTarget("ready");
-    if (!moveArmToPose(makeDownwardPose(cx, cy, CLOSEUP_HEIGHT, 0.0))) {
+    if (!moveArmToPose(makeDownwardPose(cx, cy, 0.50, 0.0))) {
       RCLCPP_WARN(node_->get_logger(),
-        "Task 3: pick scan move failed for %s at (%.3f,%.3f) — skipping",
-        shape->type.c_str(), cx, cy);
+        "Task3: observation move failed at (%.3f,%.3f) — skipping", cx, cy);
       moveArmToNamedTarget("ready");
       continue;
     }
+    rclcpp::sleep_for(std::chrono::milliseconds(500));
 
-    PointCPtr raw2 = waitForFreshCloud(5000);
-    if (!raw2 || raw2->empty()) {
+    PointCPtr raw = waitForFreshCloud(5000);
+    if (!raw || raw->empty()) {
       moveArmToNamedTarget("ready");
       continue;
     }
+    PointCPtr base      = transformCloudToBaseFrame(raw);
+    PointCPtr cropped   = cropBoxAroundPoint(base, cx, cy, 0.0, 0.15);
+    PointCPtr no_ground = removeGroundPlane(cropped, 0.012f);
 
-    PointCPtr base2     = transformCloudToBaseFrame(raw2);
-    PointCPtr cropped2  = cropBoxAroundPoint(base2, cx, cy, 0.0, CLOSEUP_CROP);
-    PointCPtr no_ground2 = removeGroundPlane(cropped2, 0.012f);
-
-    // Grasp yaw from no_ground cloud (Task 1 exact method).
+    // ── STEP B: compute grasp_yaw ──────────────────────────────────────────
     double grasp_yaw = 0.0;
-    double pick_cx   = cx;
-    double pick_cy   = cy;
+    double pick_cx = cx, pick_cy = cy;
 
-    if (no_ground2 && no_ground2->size() >= 10) {
-      if (shape->type == "nought") {
-        // Recompute centroid from no_ground for maximum positional accuracy.
-        Eigen::Vector4f ng_cen = getCloudCentroid(no_ground2);
-        pick_cx = static_cast<double>(ng_cen.x());
-        pick_cy = static_cast<double>(ng_cen.y());
-        grasp_yaw = detectNoughtYaw(no_ground2, static_cast<float>(arm_off));
-      } else {
-        float raw_yaw = detectShapeYaw(no_ground2);
-        grasp_yaw = static_cast<double>(raw_yaw);
-        while (grasp_yaw <  0.0)        grasp_yaw += M_PI / 2.0;
-        while (grasp_yaw >= M_PI / 2.0) grasp_yaw -= M_PI / 2.0;
+    if (no_ground && no_ground->size() >= 10) {
+      if (type == "nought") {
+        Eigen::Vector4f cen;
+        pcl::compute3DCentroid(*no_ground, cen);
+        pick_cx = cen[0];
+        pick_cy = cen[1];
+
+        const float ARM_OFF  = static_cast<float>(arm_off);
+        const float SEARCH_R = 0.025f;
+
+        int    best_cnt   = -1;
+        double best_theta = 0.0;
+        for (int i = 0; i < 90; ++i) {
+          const double theta = i * (M_PI / 2.0) / 90.0;
+          int cnt = 0;
+          for (int k = 0; k < 4; ++k) {
+            const double t  = theta + k * M_PI / 2.0;
+            const float  tx = static_cast<float>(pick_cx) + ARM_OFF * static_cast<float>(std::cos(t));
+            const float  ty = static_cast<float>(pick_cy) + ARM_OFF * static_cast<float>(std::sin(t));
+            for (const auto & pt : no_ground->points) {
+              const float dx = pt.x - tx, dy = pt.y - ty;
+              if (dx*dx + dy*dy < SEARCH_R * SEARCH_R) ++cnt;
+            }
+          }
+          if (cnt > best_cnt) { best_cnt = cnt; best_theta = theta; }
+        }
+        grasp_yaw = best_theta;
+      } else {  // cross
+        float raw_yaw = detectShapeYaw(no_ground);
+        double yaw = static_cast<double>(raw_yaw);
+        while (yaw <  0.0)        yaw += M_PI / 2.0;
+        while (yaw >= M_PI / 2.0) yaw -= M_PI / 2.0;
+        grasp_yaw = yaw;
       }
     } else {
       RCLCPP_WARN(node_->get_logger(),
-        "Task 3: sparse pick cloud for %s at (%.3f,%.3f) — using grasp_yaw=0",
-        shape->type.c_str(), cx, cy);
+        "Task3: sparse pick cloud — using grasp_yaw=0");
     }
 
+    // ── STEP C: grasp point ────────────────────────────────────────────────
     geometry_msgs::msg::PointStamped grasp_pt;
     grasp_pt.header.frame_id = "panda_link0";
     grasp_pt.point.x = pick_cx + arm_off * std::cos(grasp_yaw);
     grasp_pt.point.y = pick_cy + arm_off * std::sin(grasp_yaw);
     grasp_pt.point.z = GROUND_Z;
 
-    const double pick_yaw = (shape->type == "nought")
-      ? grasp_yaw + M_PI / 4.0
-      : grasp_yaw + 3.0 * M_PI / 4.0;
+    // ── STEP D: pick_yaw ───────────────────────────────────────────────────
+    double pick_yaw;
+    if (type == "nought") pick_yaw = grasp_yaw + M_PI / 4.0;
+    else                  pick_yaw = grasp_yaw + 3.0 * M_PI / 4.0;
 
-    if (shape->type == "nought") {
+    // ── STEP E: log ────────────────────────────────────────────────────────
+    if (type == "nought") {
       RCLCPP_INFO(node_->get_logger(),
-        "Nought: grasp=(%.3f,%.3f) offset=%.3fm edge_normal=%.1fdeg pick_yaw=%.1fdeg",
+        "Nought: grasp=(%.3f,%.3f) offset=%.3fm  edge_normal=%.1fdeg pick_yaw=%.1fdeg",
         grasp_pt.point.x, grasp_pt.point.y, arm_off,
         grasp_yaw * 180.0 / M_PI, pick_yaw * 180.0 / M_PI);
     } else {
       RCLCPP_INFO(node_->get_logger(),
-        "Cross: grasp=(%.3f,%.3f) offset=%.3fm across_arm=%.1fdeg pick_yaw=%.1fdeg",
+        "Cross: grasp=(%.3f,%.3f) offset=%.3fm  across_arm=%.1fdeg pick_yaw=%.1fdeg",
         grasp_pt.point.x, grasp_pt.point.y, arm_off,
-        (grasp_yaw + M_PI / 2.0) * 180.0 / M_PI, pick_yaw * 180.0 / M_PI);
+        (grasp_yaw + M_PI / 2.0) * 180.0 / M_PI,
+        pick_yaw * 180.0 / M_PI);
     }
 
+    // ── STEP F: pick ───────────────────────────────────────────────────────
     if (pickObject(grasp_pt, pick_yaw)) {
-      // Lift straight up first (Task 1 exact method) to avoid wrist spin.
+
+      // ── STEP G: lift ─────────────────────────────────────────────────────
       rclcpp::sleep_for(std::chrono::milliseconds(1500));
       arm_group_->setStartStateToCurrentState();
-      {
-        auto cur_pose = arm_group_->getCurrentPose().pose;
-        const double safe_z = std::max(cur_pose.position.z + 0.40, 0.65);
-        geometry_msgs::msg::Pose lift_pose =
-          makeDownwardPose(cur_pose.position.x, cur_pose.position.y,
-                           safe_z, pick_yaw);
-        if (!moveArmToPose(lift_pose))
-          RCLCPP_WARN(node_->get_logger(),
-            "Task 3: vertical lift failed — attempting place anyway");
-      }
+      auto cur_pose = arm_group_->getCurrentPose().pose;
+      const double safe_z = std::max(cur_pose.position.z + 0.40, 0.65);
+      moveArmToPose(makeDownwardPose(
+        cur_pose.position.x, cur_pose.position.y, safe_z, pick_yaw));
 
-      // Place into basket (Task 1 exact method).
-      geometry_msgs::msg::PointStamped basket_pt;
-      basket_pt.header.frame_id = "panda_link0";
+      // ── STEP H: place ────────────────────────────────────────────────────
+      geometry_msgs::msg::PointStamped place_pt;
+      place_pt.header.frame_id = "panda_link0";
+      place_pt.point.z = GROUND_Z;
       double place_yaw;
-      if (shape->type == "cross") {
-        place_yaw        = 3.0 * M_PI / 4.0;
-        basket_pt.point.x = basket_x + arm_off;  // ARM_OFFSET along X
-        basket_pt.point.y = basket_y;
+
+      if (type == "cross") {
+        place_yaw = 3.0 * M_PI / 4.0;
+        place_pt.point.x = basket_x + arm_off;
+        place_pt.point.y = basket_y;
       } else {
-        place_yaw         = pick_yaw;           // nought: keep pick direction
-        basket_pt.point.x = basket_x + arm_off * std::cos(grasp_yaw);
-        basket_pt.point.y = basket_y + arm_off * std::sin(grasp_yaw);
+        place_yaw = pick_yaw;
+        place_pt.point.x = basket_x + arm_off * std::cos(grasp_yaw);
+        place_pt.point.y = basket_y + arm_off * std::sin(grasp_yaw);
       }
-      basket_pt.point.z = GROUND_Z;
 
-      if (!placeObject(basket_pt, place_yaw))
-        RCLCPP_WARN(node_->get_logger(), "Task 3: place failed");
+      RCLCPP_INFO(node_->get_logger(),
+        "Task3 place EEF at (%.3f,%.3f) place_yaw=%.1fdeg → basket centre (%.3f,%.3f)",
+        place_pt.point.x, place_pt.point.y, place_yaw * 180.0 / M_PI,
+        basket_x, basket_y);
 
+      placeObject(place_pt, place_yaw);
       pick_success = true;
       break;
     } else {
       RCLCPP_WARN(node_->get_logger(),
-        "Task 3: pick failed for %s at (%.3f,%.3f) — trying next candidate",
-        shape->type.c_str(), pick_cx, pick_cy);
+        "Task3: pick failed for %s at (%.3f,%.3f) — trying next",
+        type.c_str(), cx, cy);
     }
   }
 
-  if (!pick_success)
-    RCLCPP_WARN(node_->get_logger(), "Task 3: all pick attempts failed");
+  if (!pick_success) {
+    RCLCPP_WARN(node_->get_logger(), "Task3: all pick attempts failed");
+  }
 
   // ══════════════════════════════════════════════════════════════════════════
   // PHASE 4 — CLEANUP
   // ══════════════════════════════════════════════════════════════════════════
-
-  removeCollisionObject("t3_bsk_N"); removeCollisionObject("t3_bsk_S");
-  removeCollisionObject("t3_bsk_E"); removeCollisionObject("t3_bsk_W");
+  removeCollisionObject("t3_bsk_N");
+  removeCollisionObject("t3_bsk_S");
+  removeCollisionObject("t3_bsk_E");
+  removeCollisionObject("t3_bsk_W");
   cleanupObstacles();
   moveArmToNamedTarget("ready");
   RCLCPP_INFO(node_->get_logger(), "===== Task 3 Complete =====");
