@@ -154,29 +154,23 @@ void cw2::t3_callback(
   }
 
   // ── STEP 1: Systematic 3×3 grid scan covering the full workspace ─────────
-  //   Scan ALL 9 positions at a FIXED safe height of 0.80m FIRST, then return
-  //   to "ready" before any processing.  At 0.80m the arm is nearly fully
-  //   extended upward so the elbow cannot dip below ~0.50m above the ground —
-  //   well above any shape or obstacle (max 100mm tall).
+  //   Scan ALL 9 positions FIRST, then return to "ready" before processing.
+  //   Centre/near positions use z=0.80m (elbow stays high, no collision risk).
+  //   Corner/edge positions (Y=±0.45) use z=0.65m because the Panda's reachable
+  //   horizontal radius at z=0.80 is insufficient for those lateral extents.
   //
-  //   Grid design (Z = 0.80m):
-  //     X: {-0.35,  +0.05,  +0.40}   (3 columns)
-  //     Y: {-0.45,   0.00,  +0.45}   (3 rows)  →  9 positions
-  //
-  //   Y=±0.45 covers the far front/back rows where shapes spawn up to ±0.55m.
-  //   Y=0.00 centre row provides overlap/redundancy with both outer rows.
-  //
-  //   Arm reach check (Panda max ~0.85m, Z=0.80m → horiz limit ≈0.55m):
-  //     max sqrt(x²+y²) = sqrt(0.40²+0.45²) = 0.603m  < 0.85m  ✓ all reachable
+  //   Grid (X, Y, Z):
+  //     corners/edges z=0.65:  (-0.35,±0.45), (+0.05,±0.45), (+0.40,±0.45)
+  //     centre row    z=0.80:  (-0.35,0), (+0.05,0), (+0.40,0)
   PointCPtr combined(new PointC);
-  const std::vector<std::pair<double,double>> scan_pts = {
-    {-0.35, -0.45}, {-0.35,  0.00}, {-0.35, +0.45},
-    {+0.05, -0.45}, {+0.05,  0.00}, {+0.05, +0.45},
-    {+0.40, -0.45}, {+0.40,  0.00}, {+0.40, +0.45}
+  const std::vector<std::tuple<double,double,double>> scan_pts = {
+    {-0.35, -0.45, 0.65}, {-0.35,  0.00, 0.80}, {-0.35, +0.45, 0.65},
+    {+0.05, -0.45, 0.65}, {+0.05,  0.00, 0.80}, {+0.05, +0.45, 0.65},
+    {+0.40, -0.45, 0.65}, {+0.40,  0.00, 0.80}, {+0.40, +0.45, 0.65}
   };
-  for (const auto & [sx, sy] : scan_pts) {
+  for (const auto & [sx, sy, sz] : scan_pts) {
     arm_group_->setStartStateToCurrentState();
-    if (!moveArmToPose(makeDownwardPose(sx, sy, 0.80, 0.0))) {
+    if (!moveArmToPose(makeDownwardPose(sx, sy, sz, 0.0))) {
       RCLCPP_WARN(node_->get_logger(),
         "Task 3: scan move failed (%.2f,%.2f) — skipping", sx, sy);
       continue;
@@ -518,8 +512,20 @@ void cw2::t3_callback(
               arm_off*1000.0, close_bbox*1000.0, snapped_close*1000.0);
 
             // ── Phase 5b: Task 1 exact yaw method ──────────────────────────
+            // Filter best_cl to top face only before yaw detection —
+            // side-face points corrupt the angle search (same filter as Task 1).
+            float yaw_max_z = -1e6f;
+            for (const auto & p : best_cl->points)
+              if (std::isfinite(p.z)) yaw_max_z = std::max(yaw_max_z, p.z);
+            PointCPtr yaw_cloud(new PointC);
+            for (const auto & p : best_cl->points)
+              if (std::isfinite(p.z) && p.z > yaw_max_z - 0.008f)
+                yaw_cloud->points.push_back(p);
+            yaw_cloud->width  = static_cast<uint32_t>(yaw_cloud->points.size());
+            yaw_cloud->height = 1; yaw_cloud->is_dense = true;
+
             if (shape->type == "nought") {
-              grasp_yaw = detectNoughtYaw(best_cl, static_cast<float>(arm_off));
+              grasp_yaw = detectNoughtYaw(yaw_cloud, static_cast<float>(arm_off));
               RCLCPP_INFO(node_->get_logger(),
                 "Task 3 closeup: nought yaw=%.1f° arm_off=%.0fmm "
                 "pos=(%.3f,%.3f) bbox=%.0fmm→%.0fmm",
@@ -528,7 +534,7 @@ void cw2::t3_callback(
                 close_bbox*1000.0, snapped_close*1000.0);
             } else {
               // Cross: PCA dominant arm direction (Task 1 exact method)
-              float raw_yaw = detectShapeYaw(best_cl);
+              float raw_yaw = detectShapeYaw(yaw_cloud);
               grasp_yaw = static_cast<double>(raw_yaw);
               while (grasp_yaw <  0.0)       grasp_yaw += M_PI / 2.0;
               while (grasp_yaw >= M_PI / 2.0) grasp_yaw -= M_PI / 2.0;
@@ -575,20 +581,36 @@ void cw2::t3_callback(
       arm_group_->getEndEffectorLink().c_str());
 
     if (pickObject(grasp_pt, pick_yaw)) {
+      // Lift straight up first (Task 1 exact method) before going to basket.
+      // This avoids MoveIt spinning the wrist during transit.
+      rclcpp::sleep_for(std::chrono::milliseconds(500));
+      arm_group_->setStartStateToCurrentState();
+      {
+        auto cur_pose = arm_group_->getCurrentPose().pose;
+        const double safe_z = std::max(cur_pose.position.z + 0.40, 0.65);
+        geometry_msgs::msg::Pose lift_pose =
+          makeDownwardPose(cur_pose.position.x, cur_pose.position.y,
+                           safe_z, pick_yaw);
+        if (!moveArmToPose(lift_pose)) {
+          RCLCPP_WARN(node_->get_logger(),
+            "Task 3: vertical lift failed — attempting place anyway");
+        }
+      }
+
       // Place into basket.
       //   Cross: always place with arm at 0° (along X). EEF place_yaw = 3π/4.
-      //          Pass raw basket centre; placeObject adds its own +0.08 offset.
+      //          Pass basket_x - 0.08 so placeObject's +0.08 lands at basket centre.
       //   Nought: rotationally symmetric — keep same direction as pick.
       geometry_msgs::msg::PointStamped basket_pt;
       basket_pt.header.frame_id = "panda_link0";
       double place_yaw = pick_yaw;
       if (shape->type == "cross") {
         place_yaw = 3.0 * M_PI / 4.0;
-        basket_pt.point.x = basket_x;    // raw centre — placeObject adds +0.08
+        basket_pt.point.x = basket_x - 0.08;  // placeObject adds +0.08 → net = basket_x
         basket_pt.point.y = basket_y;
       } else {
         // Nought: rotationally symmetric, keep same pick direction
-        basket_pt.point.x = basket_x;    // raw centre — placeObject adds +0.08
+        basket_pt.point.x = basket_x - 0.08;  // placeObject adds +0.08 → net = basket_x
         basket_pt.point.y = basket_y;
       }
       basket_pt.point.z = GROUND_Z;
