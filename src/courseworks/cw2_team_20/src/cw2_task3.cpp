@@ -443,18 +443,22 @@ void cw2::t3_callback(
         PointCPtr base    = transformCloudToBaseFrame(raw);
         PointCPtr cropped = cropBoxAroundPoint(base, cx, cy, 0.0, CLOSEUP_CROP);
         PointCPtr col = filterShapeColour(cropped);
-        // Use z > 0.010m instead of removeGroundPlane: RANSAC would fit to the
-        // flat top face of the shape and remove it, corrupting classification.
+        // z > 0.025m: eliminates floor-bleed coloured pixels (which appear at
+        // z≈0–0.020m due to edge interpolation at 0.5m range) while keeping
+        // the shape body (bottom at z=0.020m, top at z=0.060m).  Cutting the
+        // bottom 5mm slice (z=0.020–0.025m) does not affect the XY bbox because
+        // the outer ring radius is the same at all heights.  Critically, with
+        // floor bleed excluded there is no path for the Euclidean clusterer to
+        // bridge from floor noise into the shape, so the cluster stays tight.
         PointCPtr col_up(new PointC);
         for (const auto & pt : col->points)
-          if (std::isfinite(pt.z) && pt.z > 0.010f) col_up->points.push_back(pt);
+          if (std::isfinite(pt.z) && pt.z > 0.025f) col_up->points.push_back(pt);
         col_up->width = static_cast<uint32_t>(col_up->points.size());
         col_up->height = 1; col_up->is_dense = true;
         PointCPtr ds = voxelDownsample(col_up, 0.005f);
 
         if (ds && ds->size() >= 10) {
-          // Pick the cluster nearest to the wide-scan centroid
-          auto cls = euclideanCluster(ds, 0.03f, 10, 30000);
+          auto cls = euclideanCluster(ds, 0.015f, 10, 30000);
           PointCPtr best_cl;
           double best_d = 1e9;
           for (const auto & cl : cls) {
@@ -465,36 +469,64 @@ void cw2::t3_callback(
           }
           if (!best_cl || best_d > 0.15) best_cl = ds;  // fallback to full DS cloud
 
-          Eigen::Vector4f close_cen = getCloudCentroid(best_cl);
-          accurate_cx = close_cen.x();
-          accurate_cy = close_cen.y();
+          // ── Type verification: classify close-up top face and compare ──────
+          // This guards against the nearest cluster belonging to a neighbouring
+          // shape whose wide-scan centroid was slightly off.
+          float cu_max_z = -1e6f;
+          for (const auto & p : best_cl->points)
+            if (std::isfinite(p.z)) cu_max_z = std::max(cu_max_z, p.z);
+          PointCPtr cu_top(new PointC);
+          for (const auto & p : best_cl->points)
+            if (std::isfinite(p.z) && p.z > cu_max_z - 0.012f)
+              cu_top->points.push_back(p);
+          cu_top->width = static_cast<uint32_t>(cu_top->points.size());
+          cu_top->height = 1; cu_top->is_dense = true;
 
-          // Re-snap arm_off from close-up bbox for maximum precision
-          const double close_bbox = estimateBboxDim(best_cl);
-          double snapped_close = close_bbox;
-          arm_off = snapArmOff(shape->type, close_bbox, snapped_close);
+          const std::string closeup_type =
+            (cu_top->size() >= 30) ? classifyShape(cu_top) : "unknown";
 
-          // ── Phase 5b: Task 1 exact yaw method ────────────────────────────
-          if (shape->type == "nought") {
-            grasp_yaw = detectNoughtYaw(best_cl, static_cast<float>(arm_off));
-            RCLCPP_INFO(node_->get_logger(),
-              "Task 3 closeup: nought yaw=%.1f° arm_off=%.0fmm "
-              "pos=(%.3f,%.3f) bbox=%.0fmm→%.0fmm",
-              grasp_yaw*180.0/M_PI, arm_off*1000.0,
-              accurate_cx, accurate_cy,
-              close_bbox*1000.0, snapped_close*1000.0);
+          if (closeup_type != shape->type && closeup_type != "unknown") {
+            RCLCPP_WARN(node_->get_logger(),
+              "Task 3 closeup: type mismatch — wide=%s, closeup=%s. "
+              "Using wide-scan values.",
+              shape->type.c_str(), closeup_type.c_str());
+            // Keep accurate_cx/cy, arm_off, grasp_yaw at their wide-scan values.
           } else {
-            // Cross: PCA dominant arm direction (Task 1 exact method)
-            float raw_yaw = detectShapeYaw(best_cl);
-            grasp_yaw = static_cast<double>(raw_yaw);
-            while (grasp_yaw <  0.0)       grasp_yaw += M_PI / 2.0;
-            while (grasp_yaw >= M_PI / 2.0) grasp_yaw -= M_PI / 2.0;
+            // Type confirmed (or indeterminate) — use close-up values.
+            Eigen::Vector4f close_cen = getCloudCentroid(best_cl);
+            accurate_cx = close_cen.x();
+            accurate_cy = close_cen.y();
+
+            // Re-snap arm_off from close-up bbox for maximum precision
+            const double close_bbox = estimateBboxDim(best_cl);
+            double snapped_close = close_bbox;
+            arm_off = snapArmOff(shape->type, close_bbox, snapped_close);
             RCLCPP_INFO(node_->get_logger(),
-              "Task 3 closeup: cross yaw=%.1f° arm_off=%.0fmm "
-              "pos=(%.3f,%.3f) bbox=%.0fmm→%.0fmm",
-              grasp_yaw*180.0/M_PI, arm_off*1000.0,
-              accurate_cx, accurate_cy,
-              close_bbox*1000.0, snapped_close*1000.0);
+              "Task 3 closeup: snapped arm_off=%.0fmm (close_bbox=%.0fmm → snapped=%.0fmm)",
+              arm_off*1000.0, close_bbox*1000.0, snapped_close*1000.0);
+
+            // ── Phase 5b: Task 1 exact yaw method ──────────────────────────
+            if (shape->type == "nought") {
+              grasp_yaw = detectNoughtYaw(best_cl, static_cast<float>(arm_off));
+              RCLCPP_INFO(node_->get_logger(),
+                "Task 3 closeup: nought yaw=%.1f° arm_off=%.0fmm "
+                "pos=(%.3f,%.3f) bbox=%.0fmm→%.0fmm",
+                grasp_yaw*180.0/M_PI, arm_off*1000.0,
+                accurate_cx, accurate_cy,
+                close_bbox*1000.0, snapped_close*1000.0);
+            } else {
+              // Cross: PCA dominant arm direction (Task 1 exact method)
+              float raw_yaw = detectShapeYaw(best_cl);
+              grasp_yaw = static_cast<double>(raw_yaw);
+              while (grasp_yaw <  0.0)       grasp_yaw += M_PI / 2.0;
+              while (grasp_yaw >= M_PI / 2.0) grasp_yaw -= M_PI / 2.0;
+              RCLCPP_INFO(node_->get_logger(),
+                "Task 3 closeup: cross yaw=%.1f° arm_off=%.0fmm "
+                "pos=(%.3f,%.3f) bbox=%.0fmm→%.0fmm",
+                grasp_yaw*180.0/M_PI, arm_off*1000.0,
+                accurate_cx, accurate_cy,
+                close_bbox*1000.0, snapped_close*1000.0);
+            }
           }
         }
       }
