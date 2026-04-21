@@ -153,40 +153,42 @@ void cw2::t3_callback(
     }
   }
 
-  // ── STEP 1: Systematic 3×2 grid scan covering the full workspace ─────────
-  //   Mirrors Task 2's observeShape approach: move to position, stop, scan.
+  // ── STEP 1: Systematic 3×3 grid scan covering the full workspace ─────────
+  //   Scan ALL 9 positions at a FIXED safe height of 0.80m FIRST, then return
+  //   to "ready" before any processing.  At 0.80m the arm is nearly fully
+  //   extended upward so the elbow cannot dip below ~0.50m above the ground —
+  //   well above any shape or obstacle (max 100mm tall).
   //
-  //   Grid design (Z = ARM_OVERHEAD_Z = 0.65m):
+  //   Grid design (Z = 0.80m):
   //     X: {-0.35,  +0.05,  +0.40}   (3 columns)
-  //     Y: {-0.25,  +0.25}            (2 rows)  →  6 positions
+  //     Y: {-0.45,   0.00,  +0.45}   (3 rows)  →  9 positions
   //
-  //   Coverage per position (D435 ~70° HFOV at 0.65m): ±0.455m on ground.
-  //     Column X=-0.35 covers X ∈ [-0.81, +0.10]  (workspace left edge -0.60 ✓)
-  //     Column X=+0.40 covers X ∈ [-0.06, +0.86]  (workspace right edge +0.70 ✓)
-  //     Row Y=-0.25    covers Y ∈ [-0.71, +0.21]
-  //     Row Y=+0.25    covers Y ∈ [-0.21, +0.71]  (workspace edges ±0.55 ✓)
+  //   Y=±0.45 covers the far front/back rows where shapes spawn up to ±0.55m.
+  //   Y=0.00 centre row provides overlap/redundancy with both outer rows.
   //
-  //   Arm reach check (Panda max ~0.85m, Z=0.65m → horiz limit ≈0.55m):
-  //     max sqrt(x²+y²) = sqrt(0.40²+0.25²) = 0.472m  < 0.55m  ✓ all reachable
+  //   Arm reach check (Panda max ~0.85m, Z=0.80m → horiz limit ≈0.55m):
+  //     max sqrt(x²+y²) = sqrt(0.40²+0.45²) = 0.603m  < 0.85m  ✓ all reachable
   PointCPtr combined(new PointC);
   const std::vector<std::pair<double,double>> scan_pts = {
-    {-0.35, -0.25}, {-0.35, +0.25},
-    {+0.05, -0.25}, {+0.05, +0.25},
-    {+0.40, -0.25}, {+0.40, +0.25}
+    {-0.35, -0.45}, {-0.35,  0.00}, {-0.35, +0.45},
+    {+0.05, -0.45}, {+0.05,  0.00}, {+0.05, +0.45},
+    {+0.40, -0.45}, {+0.40,  0.00}, {+0.40, +0.45}
   };
   for (const auto & [sx, sy] : scan_pts) {
-    // Refresh robot state before each move to avoid sim_time stale-state errors
     arm_group_->setStartStateToCurrentState();
-    if (!moveArmToPose(makeDownwardPose(sx, sy, ARM_OVERHEAD_Z))) {
+    if (!moveArmToPose(makeDownwardPose(sx, sy, 0.80, 0.0))) {
       RCLCPP_WARN(node_->get_logger(),
-        "Task 3: scan move failed (%.2f,%.2f)", sx, sy);
+        "Task 3: scan move failed (%.2f,%.2f) — skipping", sx, sy);
+      continue;
     }
-    // Use 5000ms wait (matching Task 2's observeShape) for a stable cloud
-    PointCPtr raw = waitForFreshCloud(5000);
+    PointCPtr raw = waitForFreshCloud(3000);
     if (!raw || raw->empty()) continue;
     PointCPtr base = transformCloudToBaseFrame(raw);
     if (base && !base->empty()) *combined += *base;
   }
+
+  // Return to ready BEFORE any processing or picking
+  moveArmToNamedTarget("ready");
 
   if (combined->empty()) {
     RCLCPP_WARN(node_->get_logger(), "Task 3: no cloud data — aborting");
@@ -266,6 +268,14 @@ void cw2::t3_callback(
   // oblique-angle side-face points; projecting side faces into XY can create
   // false enclosed regions in crosses and fill in the central hole of noughts.
   // The top face alone gives a clean 2D projection for hole detection.
+  // Basket candidates defined early so they can filter basket-wall clusters
+  // from shape detection.  The basket (RGB≈[0.5,0.2,0.2]) passes the R>0.50
+  // colour filter and its ~185mm bbox passes the cross→nought reclassification
+  // rule, producing a spurious "nought" near the basket position.
+  const std::vector<std::pair<double,double>> basket_candidates = {
+    {-0.41, -0.36}, {-0.41,  0.36}
+  };
+
   std::vector<DetectedShape> detected;
   {
     PointCPtr shape_col = filterShapeColour(combined);
@@ -281,7 +291,7 @@ void cw2::t3_callback(
       const double bbox = estimateBboxDim(cl);
       // Valid shape range: cross x=20mm → 60mm outer, nought x=40mm → 200mm outer.
       // Allow ±50% around smallest/largest tiers: [30mm, 250mm].
-      if (bbox < 0.030 || bbox > 0.25) continue;
+      if (bbox < 0.055 || bbox > 0.25) continue;
       const Eigen::Vector4f cen = getCloudCentroid(cl);
       // Discard clusters whose centroid is < 0.15m from the robot base: these
       // are artefacts from robot-body reflections, not real shapes.
@@ -298,7 +308,7 @@ void cw2::t3_callback(
       max_z = std::min(max_z, 0.070f);   // clamp for top-face slice
       PointCPtr top_face(new PointC);
       for (const auto & pt : cl->points)
-        if (pt.z > max_z - 0.012f) top_face->points.push_back(pt);
+        if (pt.z > max_z - 0.008f) top_face->points.push_back(pt);
       top_face->width = static_cast<uint32_t>(top_face->points.size());
       top_face->height = 1; top_face->is_dense = true;
       RCLCPP_INFO(node_->get_logger(),
@@ -326,17 +336,6 @@ void cw2::t3_callback(
       std::string type = classifyShape(top_face);
       if (type != "nought" && type != "cross") continue;
 
-      // Size-sanity reclassification: cross outer = 3×bar, max 3×40=120mm.
-      // If classifyShape returns "cross" but measured bbox exceeds that, it is
-      // almost certainly a large nought (outer 5×bar, 100–200mm) with a ring gap
-      // that fooled hole detection.  Reclassify to nought.
-      if (type == "cross" && bbox > 0.130) {
-        RCLCPP_WARN(node_->get_logger(),
-          "Task 3: reclassify cross→nought at (%.3f,%.3f) "
-          "(raw_bbox=%.0fmm > 130mm cross max)",
-          cen.x(), cen.y(), bbox*1000.0);
-        type = "nought";
-      }
       // Similarly: nought outer = 5×bar, max 5×40=200mm.  A "nought" with bbox
       // much larger than 230mm (>15% above max) is likely two merged shapes — skip.
       if (type == "nought" && bbox > 0.230) {
@@ -356,6 +355,21 @@ void cw2::t3_callback(
     }
   }
 
+  // Post-filter: remove any detected cluster whose centroid is within 0.32m of
+  // a basket candidate.  Basket walls pass the colour and bbox filters and can
+  // be misclassified as noughts; this removes them before counting.
+  detected.erase(
+    std::remove_if(detected.begin(), detected.end(),
+      [&](const DetectedShape & s) {
+        for (const auto & [bx, by] : basket_candidates) {
+          if (std::hypot(s.centroid.x() - bx,
+                         s.centroid.y() - by) < 0.32)
+            return true;
+        }
+        return false;
+      }),
+    detected.end());
+
   // ── STEP 4: Count and report ─────────────────────────────────────────────
   int n_nought = 0, n_cross = 0;
   for (const auto & s : detected) {
@@ -373,9 +387,7 @@ void cw2::t3_callback(
     n_nought, n_cross, total, common.c_str(), num_common);
 
   // ── STEP 5: Detect basket (2 known candidate positions) ──────────────────
-  const std::vector<std::pair<double,double>> basket_candidates = {
-    {-0.41, -0.36}, {-0.41,  0.36}
-  };
+  // basket_candidates already defined above for shape post-filtering.
   double basket_x = basket_candidates[0].first;
   double basket_y = basket_candidates[0].second;
   {
@@ -546,27 +558,38 @@ void cw2::t3_callback(
       ? grasp_yaw + M_PI / 4.0
       : grasp_yaw + 3.0 * M_PI / 4.0;
 
+    if (shape->type == "nought") {
+      RCLCPP_INFO(node_->get_logger(),
+        "Nought: grasp=(%.3f,%.3f) offset=%.3fm edge_normal=%.1fdeg pick_yaw=%.1fdeg",
+        grasp_pt.point.x, grasp_pt.point.y, arm_off,
+        grasp_yaw * 180.0 / M_PI, pick_yaw * 180.0 / M_PI);
+    } else {
+      RCLCPP_INFO(node_->get_logger(),
+        "Cross: grasp=(%.3f,%.3f) offset=%.3fm across_arm=%.1fdeg pick_yaw=%.1fdeg",
+        grasp_pt.point.x, grasp_pt.point.y, arm_off,
+        (grasp_yaw + M_PI / 2.0) * 180.0 / M_PI, pick_yaw * 180.0 / M_PI);
+    }
+
     RCLCPP_INFO(node_->get_logger(),
-      "Task 3: picking %s grasp=(%.3f,%.3f) pick_yaw=%.1f° arm_off=%.0fmm",
-      shape->type.c_str(),
-      grasp_pt.point.x, grasp_pt.point.y,
-      pick_yaw*180.0/M_PI, arm_off*1000.0);
+      "Task 3: eef_link = '%s'",
+      arm_group_->getEndEffectorLink().c_str());
 
     if (pickObject(grasp_pt, pick_yaw)) {
-      // Place into basket — match Task 1 place logic exactly:
+      // Place into basket.
       //   Cross: always place with arm at 0° (along X). EEF place_yaw = 3π/4.
-      //          Offset basket point by arm_off in +X (as Task 1 does).
+      //          Pass raw basket centre; placeObject adds its own +0.08 offset.
       //   Nought: rotationally symmetric — keep same direction as pick.
       geometry_msgs::msg::PointStamped basket_pt;
       basket_pt.header.frame_id = "panda_link0";
       double place_yaw = pick_yaw;
       if (shape->type == "cross") {
-        place_yaw = 3.0 * M_PI / 4.0;           // arm at 0° world frame
-        basket_pt.point.x = basket_x + arm_off;  // offset along 0°
+        place_yaw = 3.0 * M_PI / 4.0;
+        basket_pt.point.x = basket_x;    // raw centre — placeObject adds +0.08
         basket_pt.point.y = basket_y;
       } else {
-        basket_pt.point.x = basket_x + arm_off * std::cos(grasp_yaw);
-        basket_pt.point.y = basket_y + arm_off * std::sin(grasp_yaw);
+        // Nought: rotationally symmetric, keep same pick direction
+        basket_pt.point.x = basket_x;    // raw centre — placeObject adds +0.08
+        basket_pt.point.y = basket_y;
       }
       basket_pt.point.z = GROUND_Z;
       if (!placeObject(basket_pt, place_yaw))
