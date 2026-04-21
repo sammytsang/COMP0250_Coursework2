@@ -149,16 +149,17 @@ void cw2::t3_callback(
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // PHASE 1 — COARSE SCAN
-  // Visit all 9 grid positions at safe heights, accumulate a single combined
-  // point cloud, then return to "ready" before any processing.
+  // PHASE 1 — WIDE COARSE SCAN (4×4 grid, 16 positions, all at z=0.65)
+  // Visit all 16 grid positions, accumulate a single combined point cloud,
+  // then return to "ready" before any processing.
   // ══════════════════════════════════════════════════════════════════════════
 
   PointCPtr combined(new PointC);
   const std::vector<std::tuple<double,double,double>> scan_pts = {
-    {-0.35, -0.45, 0.65}, {-0.35,  0.00, 0.80}, {-0.35, +0.45, 0.65},
-    {+0.05, -0.45, 0.65}, {+0.05,  0.00, 0.80}, {+0.05, +0.45, 0.65},
-    {+0.40, -0.45, 0.65}, {+0.40,  0.00, 0.80}, {+0.40, +0.45, 0.65}
+    {-0.50, -0.45, 0.65}, {-0.50, -0.15, 0.65}, {-0.50, +0.15, 0.65}, {-0.50, +0.45, 0.65},
+    {-0.20, -0.45, 0.65}, {-0.20, -0.15, 0.65}, {-0.20, +0.15, 0.65}, {-0.20, +0.45, 0.65},
+    {+0.15, -0.45, 0.65}, {+0.15, -0.15, 0.65}, {+0.15, +0.15, 0.65}, {+0.15, +0.45, 0.65},
+    {+0.45, -0.45, 0.65}, {+0.45, -0.15, 0.65}, {+0.45, +0.15, 0.65}, {+0.45, +0.45, 0.65}
   };
   for (const auto & [sx, sy, sz] : scan_pts) {
     arm_group_->setStartStateToCurrentState();
@@ -278,10 +279,10 @@ void cw2::t3_callback(
         continue;
       }
 
-      // Proximity guard: skip if within 0.32m of a basket candidate.
+      // Proximity guard: skip if within 0.20m of a basket candidate.
       bool near_basket = false;
       for (const auto & [bx, by] : basket_candidates)
-        if (std::hypot(cen.x() - bx, cen.y() - by) < 0.32) { near_basket = true; break; }
+        if (std::hypot(cen.x() - bx, cen.y() - by) < 0.20) { near_basket = true; break; }
       if (near_basket) continue;
 
       coarse_positions.push_back({static_cast<double>(cen.x()),
@@ -328,6 +329,7 @@ void cw2::t3_callback(
 
   std::vector<DetectedShape> detected;
   for (const auto & [px, py] : coarse_positions) {
+    moveArmToNamedTarget("ready");
     if (!moveArmToPose(makeDownwardPose(px, py, CLOSEUP_HEIGHT, 0.0))) {
       RCLCPP_WARN(node_->get_logger(),
         "Task 3: confirmation move failed at (%.3f,%.3f) — skipping", px, py);
@@ -391,12 +393,12 @@ void cw2::t3_callback(
     moveArmToNamedTarget("ready");
   }
 
-  // Basket proximity post-filter (0.32m).
+  // Basket proximity post-filter (0.20m).
   detected.erase(
     std::remove_if(detected.begin(), detected.end(),
       [&](const DetectedShape & s) {
         for (const auto & [bx, by] : basket_candidates)
-          if (std::hypot(s.centroid.x() - bx, s.centroid.y() - by) < 0.32)
+          if (std::hypot(s.centroid.x() - bx, s.centroid.y() - by) < 0.20)
             return true;
         return false;
       }),
@@ -438,14 +440,15 @@ void cw2::t3_callback(
     const double cy     = static_cast<double>(shape->centroid.y());
     const double arm_off = shape->arm_off;
 
-    if (std::hypot(cx, cy) < 0.20) {
+    if (std::hypot(cx, cy) < 0.12) {
       RCLCPP_WARN(node_->get_logger(),
         "Task 3: skipping %s at (%.3f,%.3f) — too close to base",
         shape->type.c_str(), cx, cy);
       continue;
     }
 
-    // Move 0.50m above the confirmed centroid and take a fresh cloud.
+    // Move to ready, then 0.50m above the confirmed centroid and take a fresh cloud.
+    moveArmToNamedTarget("ready");
     if (!moveArmToPose(makeDownwardPose(cx, cy, CLOSEUP_HEIGHT, 0.0))) {
       RCLCPP_WARN(node_->get_logger(),
         "Task 3: pick scan move failed for %s at (%.3f,%.3f) — skipping",
@@ -512,7 +515,7 @@ void cw2::t3_callback(
 
     if (pickObject(grasp_pt, pick_yaw)) {
       // Lift straight up first (Task 1 exact method) to avoid wrist spin.
-      rclcpp::sleep_for(std::chrono::milliseconds(500));
+      rclcpp::sleep_for(std::chrono::milliseconds(1500));
       arm_group_->setStartStateToCurrentState();
       {
         auto cur_pose = arm_group_->getCurrentPose().pose;
@@ -531,7 +534,7 @@ void cw2::t3_callback(
       double place_yaw;
       if (shape->type == "cross") {
         place_yaw        = 3.0 * M_PI / 4.0;
-        basket_pt.point.x = basket_x + 0.060;  // ARM_OFFSET for cross
+        basket_pt.point.x = basket_x + arm_off;  // ARM_OFFSET along X
         basket_pt.point.y = basket_y;
       } else {
         place_yaw         = pick_yaw;           // nought: keep pick direction
