@@ -168,7 +168,8 @@ void cw2::t3_callback(
         "Task 3: scan move failed (%.2f,%.2f) — skipping", sx, sy);
       continue;
     }
-    PointCPtr raw = waitForFreshCloud(3000);
+    rclcpp::sleep_for(std::chrono::milliseconds(800));
+    PointCPtr raw = waitForFreshCloud(5000);
     if (!raw || raw->empty()) continue;
     PointCPtr base = transformCloudToBaseFrame(raw);
     if (base && !base->empty()) *combined += *base;
