@@ -1,100 +1,58 @@
 #include <cw2_class.h>
-#include <sensor_msgs/msg/point_cloud2.hpp>
-#include <pcl/point_cloud.h>
-#include <pcl/point_types.h>
-#include <pcl_conversions/pcl_conversions.h>
 #include <pcl/filters/crop_box.h>
 #include <pcl/filters/passthrough.h>
 #include <cmath>
-#include <mutex>
-#include <atomic>
 
-static sensor_msgs::msg::PointCloud2::SharedPtr
-waitForFreshCloud(rclcpp::Node::SharedPtr node,
-                  const std::string & topic,
-                  int timeout_ms = 5000)
+struct ShapeClassification {
+  std::string type;       // "nought", "cross", or "unknown"
+  float centre_ratio;
+  int   total_pts;
+};
+
+// cloud must already be in the base/world frame
+static ShapeClassification
+classifyShape(PointCPtr cloud, double cx, double cy)
 {
-  sensor_msgs::msg::PointCloud2::SharedPtr result;
-  std::mutex mtx;
-  std::atomic<bool> received{false};
+  ShapeClassification result{"unknown", 0.0f, 0};
+  if (!cloud || cloud->empty()) return result;
 
-  auto sub = node->create_subscription<sensor_msgs::msg::PointCloud2>(
-    topic, rclcpp::SensorDataQoS(),
-    [&](sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-      if (!received.load()) {
-        std::lock_guard<std::mutex> lock(mtx);
-        result = msg;
-        received.store(true);
-      }
-    });
-
-  const auto deadline =
-    node->now() + rclcpp::Duration::from_nanoseconds(
-      static_cast<int64_t>(timeout_ms) * 1000000LL);
-
-  rclcpp::Rate rate(50);
-  while (rclcpp::ok() && !received.load() && node->now() < deadline) {
-    rclcpp::spin_some(node);
-    rate.sleep();
-  }
-
-  return result;
-}
-
-static std::string
-classifyShape(const sensor_msgs::msg::PointCloud2::SharedPtr & cloud_msg,
-              double cx, double cy)
-{
-  if (!cloud_msg) return "unknown";
-
-  // Convert to PCL
-  pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
-  pcl::fromROSMsg(*cloud_msg, *cloud);
-
-  if (cloud->empty()) return "unknown";
-
-  // Step 1: Crop to a box around the shape (200x200mm = 0.2x0.2m + margin)
-  pcl::CropBox<pcl::PointXYZ> crop;
+  // Step 1: Crop ±150mm around known shape XY
+  pcl::CropBox<PointT> crop;
   crop.setInputCloud(cloud);
   crop.setMin(Eigen::Vector4f(cx - 0.15f, cy - 0.15f, -10.0f, 1.0f));
   crop.setMax(Eigen::Vector4f(cx + 0.15f, cy + 0.15f,  10.0f, 1.0f));
-  pcl::PointCloud<pcl::PointXYZ>::Ptr cropped(new pcl::PointCloud<pcl::PointXYZ>);
+  PointCPtr cropped(new PointC);
   crop.filter(*cropped);
+  if (cropped->empty()) return result;
 
-  if (cropped->empty()) return "unknown";
-
-  // Step 2: Remove ground plane (keep only top 30mm of points)
+  // Step 2: Keep top 30mm (ground removal, robust to 50mm noise)
   float max_z = -1e6f;
   for (const auto & pt : *cropped) max_z = std::max(max_z, pt.z);
-  pcl::PassThrough<pcl::PointXYZ> pass;
+  pcl::PassThrough<PointT> pass;
   pass.setInputCloud(cropped);
   pass.setFilterFieldName("z");
   pass.setFilterLimits(max_z - 0.03f, max_z + 0.01f);
-  pcl::PointCloud<pcl::PointXYZ>::Ptr shape_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+  PointCPtr shape_cloud(new PointC);
   pass.filter(*shape_cloud);
+  if (shape_cloud->empty()) return result;
 
-  if (shape_cloud->empty()) return "unknown";
-
-  // Step 3: Count points in centre region (inner 60x60mm = 0.06x0.06m)
-  // Nought = hollow -> few centre points
-  // Cross  = solid  -> many centre points
+  // Step 3: Centre void test (rotation-invariant)
+  //   Nought: inner void 120×120mm → ~0% centre density
+  //   Cross:  centre block 40×40mm → ~22% centre density
+  const float centre_half = 0.03f;  // ±30mm
   int centre_count = 0;
-  int total_count = static_cast<int>(shape_cloud->size());
-  const float centre_half = 0.03f;  // 60mm / 2
-
   for (const auto & pt : *shape_cloud) {
-    if (std::abs(pt.x - cx) < centre_half &&
-        std::abs(pt.y - cy) < centre_half) {
+    if (std::abs(pt.x - static_cast<float>(cx)) < centre_half &&
+        std::abs(pt.y - static_cast<float>(cy)) < centre_half)
       centre_count++;
-    }
   }
 
-  const float centre_ratio =
-    (total_count > 0) ? static_cast<float>(centre_count) / total_count : 0.0f;
+  const int   total   = static_cast<int>(shape_cloud->size());
+  const float c_ratio = (total > 0) ? static_cast<float>(centre_count) / total : 0.0f;
 
-  // If more than 15% of points are in the centre -> cross
-  // Otherwise -> nought (hollow centre)
-  const std::string result = (centre_ratio > 0.15f) ? "cross" : "nought";
+  result.centre_ratio = c_ratio;
+  result.total_pts    = total;
+  result.type         = (c_ratio > 0.15f) ? "cross" : "nought";
   return result;
 }
 
@@ -106,58 +64,53 @@ void cw2::t2_callback(
 
   if (request->ref_object_points.size() < 2) {
     RCLCPP_ERROR(node_->get_logger(),
-      "Task 2: expected 2 reference points, got %zu. Defaulting to 1.",
+      "Task 2: expected 2 ref points, got %zu. Defaulting to 1.",
       request->ref_object_points.size());
     response->mystery_object_num = 1;
     return;
   }
 
-  const std::string cloud_topic = "/r200/camera/depth_registered/points";
-
-  // Height above shape to hover for observation (metres)
   static constexpr double OBSERVE_HEIGHT = 0.5;
 
-  // Helper lambda: move arm above a point and classify the shape below
+  // Move above shape, grab fresh cloud, transform to base frame, classify
   auto observeShape = [&](const geometry_msgs::msg::PointStamped & pt) -> std::string
   {
-    // Move arm above the shape
     geometry_msgs::msg::Pose observe_pose =
-      makeDownwardPose(pt.point.x, pt.point.y,
-                       pt.point.z + OBSERVE_HEIGHT, 0.0);
+      makeDownwardPose(pt.point.x, pt.point.y, pt.point.z + OBSERVE_HEIGHT, 0.0);
     bool moved = moveArmToPose(observe_pose);
-    if (!moved) {
+    if (!moved)
       RCLCPP_WARN(node_->get_logger(),
         "Task 2: failed to move above (%.3f, %.3f), trying anyway",
         pt.point.x, pt.point.y);
-    }
 
-    // Wait for a fresh point cloud
-    auto cloud = ::waitForFreshCloud(node_, cloud_topic, 5000);
-    if (!cloud) {
+    // Use the class's waitForFreshCloud — safe from service callback because
+    // cloud_callback runs in a Reentrant group via MultiThreadedExecutor
+    PointCPtr raw = waitForFreshCloud(5000);
+    if (!raw || raw->empty()) {
       RCLCPP_WARN(node_->get_logger(),
-        "Task 2: no point cloud received for (%.3f, %.3f)",
-        pt.point.x, pt.point.y);
+        "Task 2: no cloud for (%.3f, %.3f)", pt.point.x, pt.point.y);
       return "unknown";
     }
 
-    // Classify the shape
-    std::string shape = ::classifyShape(cloud, pt.point.x, pt.point.y);
+    PointCPtr cloud_base = transformCloudToBaseFrame(raw);
+
+    auto cls = ::classifyShape(cloud_base, pt.point.x, pt.point.y);
     RCLCPP_INFO(node_->get_logger(),
-      "Task 2: shape at (%.3f, %.3f) classified as '%s'",
-      pt.point.x, pt.point.y, shape.c_str());
-    return shape;
+      "Task 2: shape at (%.3f, %.3f) → '%s'  (centre_ratio=%.2f, pts=%d)",
+      pt.point.x, pt.point.y, cls.type.c_str(), cls.centre_ratio, cls.total_pts);
+    return cls.type;
   };
 
-  // Observe all three shapes
   std::string ref1_type    = observeShape(request->ref_object_points[0]);
   std::string ref2_type    = observeShape(request->ref_object_points[1]);
   std::string mystery_type = observeShape(request->mystery_object_point);
+
+  moveArmToNamedTarget("ready");
 
   RCLCPP_INFO(node_->get_logger(),
     "Task 2: Ref1='%s' | Ref2='%s' | Mystery='%s'",
     ref1_type.c_str(), ref2_type.c_str(), mystery_type.c_str());
 
-  // Match mystery to reference
   if (mystery_type != "unknown" && mystery_type == ref1_type) {
     response->mystery_object_num = 1;
   } else if (mystery_type != "unknown" && mystery_type == ref2_type) {
@@ -169,6 +122,5 @@ void cw2::t2_callback(
   }
 
   RCLCPP_INFO(node_->get_logger(),
-    "===== Task 2 Complete: answer=%ld =====",
-    response->mystery_object_num);
+    "===== Task 2 Complete: answer=%ld =====", response->mystery_object_num);
 }
