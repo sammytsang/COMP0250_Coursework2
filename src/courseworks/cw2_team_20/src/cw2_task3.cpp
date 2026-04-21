@@ -57,7 +57,7 @@ static double snapArmOff(const std::string & type, double measured_bbox,
     return arm_offs[best];
   } else {
     constexpr double tiers[]    = {0.060, 0.090, 0.120};
-    constexpr double arm_offs[] = {0.030, 0.045, 0.060};
+    constexpr double arm_offs[] = {0.040, 0.055, 0.060};
     int best = 0;
     double best_d = std::abs(measured_bbox - tiers[0]);
     for (int i = 1; i < 3; ++i) {
@@ -194,9 +194,9 @@ void cw2::t3_callback(
   std::vector<std::string> obstacle_ids;
   {
     PointCPtr dark = filterByColourRange(combined,
-                                          0.00f, 0.15f,
-                                          0.00f, 0.15f,
-                                          0.00f, 0.15f);
+                                          0.00f, 0.20f,
+                                          0.00f, 0.20f,
+                                          0.00f, 0.20f);
     PointCPtr dark_up(new PointC);
     for (const auto & pt : dark->points)
       if (pt.z > 0.010f) dark_up->points.push_back(pt);
@@ -212,10 +212,10 @@ void cw2::t3_callback(
         xmin = std::min(xmin, pt.x); xmax = std::max(xmax, pt.x);
         ymin = std::min(ymin, pt.y); ymax = std::max(ymax, pt.y);
       }
-      const double osx = (xmax - xmin) + 0.04;
-      const double osy = (ymax - ymin) + 0.04;
+      const double osx = (xmax - xmin) + 0.10;
+      const double osy = (ymax - ymin) + 0.10;
       const std::string id = "t3_obs_" + std::to_string(n++);
-      addBoxCollisionObject(id, cen[0], cen[1], GROUND_Z + 0.10, osx, osy, 0.22);
+      addBoxCollisionObject(id, cen[0], cen[1], GROUND_Z + 0.15, osx, osy, 0.35);
       obstacle_ids.push_back(id);
       RCLCPP_INFO(node_->get_logger(),
         "Task3 obstacle '%s': pos=(%.3f,%.3f) size=(%.3f,%.3f)",
@@ -253,7 +253,7 @@ void cw2::t3_callback(
   }
 
   // ── COARSE SHAPE DETECTION ────────────────────────────────────────────────
-  std::vector<std::pair<double,double>> coarse_positions;
+  std::vector<std::tuple<double,double,double>> coarse_positions;
   {
     PointCPtr shape_col = filterShapeColour(combined);
     PointCPtr shape_up(new PointC);
@@ -282,7 +282,7 @@ void cw2::t3_callback(
         if (pt.z > top_thresh) top_face->points.push_back(pt);
       top_face->width  = static_cast<uint32_t>(top_face->points.size());
       top_face->height = 1; top_face->is_dense = true;
-      if (top_face->size() < 8) continue;
+      if (top_face->size() < 5) continue;
 
       const float min_pts = static_cast<float>(bbox * bbox * 4000.0);
       if (top_face->size() < static_cast<size_t>(min_pts)) {
@@ -294,7 +294,7 @@ void cw2::t3_callback(
 
       if (std::hypot(cen[0] - basket_x, cen[1] - basket_y) < 0.18) continue;
 
-      coarse_positions.emplace_back(cen[0], cen[1]);
+      coarse_positions.emplace_back(cen[0], cen[1], bbox);
       RCLCPP_INFO(node_->get_logger(),
         "Task3 coarse: (%.3f, %.3f) bbox=%.0fmm",
         cen[0], cen[1], bbox * 1000.0);
@@ -308,16 +308,26 @@ void cw2::t3_callback(
   // PHASE 2 — INDIVIDUAL CLOSE-UP SCAN (Task 2 exact method)
   // ══════════════════════════════════════════════════════════════════════════
 
-  constexpr double CLOSEUP_HEIGHT = 0.50;
   constexpr double CLOSEUP_CROP   = 0.15;
 
   std::vector<DetectedShape> detected;
 
   for (const auto & p : coarse_positions) {
-    const double px = p.first, py = p.second;
+    const double px          = std::get<0>(p);
+    const double py          = std::get<1>(p);
+    const double coarse_bbox = std::get<2>(p);
+
+    double closeup_h;
+    if      (coarse_bbox >= 0.12) closeup_h = 0.50;
+    else if (coarse_bbox >= 0.07) closeup_h = 0.40;
+    else                          closeup_h = 0.35;
+
+    RCLCPP_INFO(node_->get_logger(),
+      "Task3 close-up scan at (%.3f,%.3f) coarse_bbox=%.0fmm height=%.2fm",
+      px, py, coarse_bbox * 1000.0, closeup_h);
 
     moveArmToNamedTarget("ready");
-    if (!moveArmToPose(makeDownwardPose(px, py, CLOSEUP_HEIGHT, 0.0))) {
+    if (!moveArmToPose(makeDownwardPose(px, py, closeup_h, 0.0))) {
       RCLCPP_WARN(node_->get_logger(),
         "Task3: close-up move failed at (%.3f,%.3f) — skipping", px, py);
       moveArmToNamedTarget("ready");
@@ -347,7 +357,7 @@ void cw2::t3_callback(
     top_face->width  = static_cast<uint32_t>(top_face->points.size());
     top_face->height = 1; top_face->is_dense = true;
 
-    if (top_face->size() < 30) {
+    if (top_face->size() < 15) {
       RCLCPP_WARN(node_->get_logger(),
         "Task3: too few top-face points (%zu) at (%.3f,%.3f)",
         top_face->size(), px, py);
@@ -398,6 +408,22 @@ void cw2::t3_callback(
     "Task3: noughts=%d crosses=%d total=%d most_common=%s(%d)",
     n_nought, n_cross, total, common.c_str(), num_common);
 
+  RCLCPP_INFO(node_->get_logger(), "========================================");
+  RCLCPP_INFO(node_->get_logger(), "Task3 SCAN SUMMARY:");
+  RCLCPP_INFO(node_->get_logger(), "  Total shapes found : %d", total);
+  RCLCPP_INFO(node_->get_logger(), "  Noughts            : %d", n_nought);
+  RCLCPP_INFO(node_->get_logger(), "  Crosses            : %d", n_cross);
+  RCLCPP_INFO(node_->get_logger(), "  Most common        : %s (%d)", common.c_str(), num_common);
+  RCLCPP_INFO(node_->get_logger(), "  Will pick a        : %s", common.c_str());
+  RCLCPP_INFO(node_->get_logger(), "  Individual shapes:");
+  for (const auto & d : detected) {
+    RCLCPP_INFO(node_->get_logger(),
+      "    - %s at (%.3f, %.3f)  bbox=%.0fmm  arm_off=%.0fmm",
+      d.type.c_str(), d.centroid[0], d.centroid[1],
+      d.bbox_dim * 1000.0, d.arm_off * 1000.0);
+  }
+  RCLCPP_INFO(node_->get_logger(), "========================================");
+
   // ══════════════════════════════════════════════════════════════════════════
   // PHASE 3 — PICK AND PLACE (Task 1 exact method)
   // ══════════════════════════════════════════════════════════════════════════
@@ -420,7 +446,7 @@ void cw2::t3_callback(
     const double arm_off = shape->arm_off;
     const std::string & type = shape->type;
 
-    if (std::hypot(cx, cy) < 0.12) continue;
+    if (std::hypot(cx, cy) < 0.22) continue;
 
     // ── STEP A: observe ────────────────────────────────────────────────────
     moveArmToNamedTarget("ready");
@@ -493,8 +519,8 @@ void cw2::t3_callback(
 
     // ── STEP D: pick_yaw ───────────────────────────────────────────────────
     double pick_yaw;
-    if (type == "nought") pick_yaw = grasp_yaw + M_PI / 4.0;
-    else                  pick_yaw = grasp_yaw + 3.0 * M_PI / 4.0;
+    if (type == "nought") pick_yaw = grasp_yaw + M_PI / 2.0;
+    else                  pick_yaw = grasp_yaw;
 
     // ── STEP E: log ────────────────────────────────────────────────────────
     if (type == "nought") {
@@ -513,6 +539,11 @@ void cw2::t3_callback(
     // ── STEP F: pick ───────────────────────────────────────────────────────
     if (pickObject(grasp_pt, pick_yaw)) {
 
+      auto cur_joints = arm_group_->getCurrentJointValues();
+      if (cur_joints.empty()) {
+        RCLCPP_WARN(node_->get_logger(), "Task3: joint state empty after pick");
+      }
+
       // ── STEP G: lift ─────────────────────────────────────────────────────
       rclcpp::sleep_for(std::chrono::milliseconds(1500));
       arm_group_->setStartStateToCurrentState();
@@ -524,7 +555,7 @@ void cw2::t3_callback(
       // ── STEP H: place ────────────────────────────────────────────────────
       geometry_msgs::msg::PointStamped place_pt;
       place_pt.header.frame_id = "panda_link0";
-      place_pt.point.z = GROUND_Z;
+      place_pt.point.z = GROUND_Z + 0.03;
       double place_yaw;
 
       if (type == "cross") {
@@ -541,6 +572,10 @@ void cw2::t3_callback(
         "Task3 place EEF at (%.3f,%.3f) place_yaw=%.1fdeg → basket centre (%.3f,%.3f)",
         place_pt.point.x, place_pt.point.y, place_yaw * 180.0 / M_PI,
         basket_x, basket_y);
+
+      RCLCPP_INFO(node_->get_logger(),
+        "Task3 place: descending to z=%.3f before release",
+        place_pt.point.z);
 
       placeObject(place_pt, place_yaw);
       pick_success = true;
